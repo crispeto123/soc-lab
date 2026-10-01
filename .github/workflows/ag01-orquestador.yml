@@ -1,0 +1,90 @@
+# AG-01 Orquestador — Lab costo cero (ADR-002)
+# Patrón Secuencial + Concurrente (ADR-001): AG-02 y AG-03 en paralelo -> consolidación.
+name: AG-01 Orquestador
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 11 * * 1"   # lunes 06:00 Bogotá — revisión semanal
+
+permissions:
+  contents: read          # mínimo privilegio: solo lectura
+
+concurrency:
+  group: ag01-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ag02-code-reviewer:
+    name: AG-02 Code Reviewer
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep (SAST)
+        run: |
+          pip install --quiet semgrep
+          semgrep scan --config p/default --config p/secrets \
+            --sarif --output semgrep.sarif --metrics off . || true
+      - name: Gitleaks (secretos)
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest \
+            dir /repo --report-format sarif --report-path /repo/gitleaks.sarif --exit-code 0 || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sarif-ag02
+          path: "*.sarif"
+          if-no-files-found: warn
+
+  ag03-dependency-iac:
+    name: AG-03 Dependency & IaC Auditor
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy (dependencias + misconfig)
+        run: |
+          docker run --rm -v "$PWD:/src" aquasec/trivy:latest fs /src \
+            --scanners vuln,misconfig --format sarif --output /src/trivy.sarif --exit-code 0 || true
+      - name: OSV-Scanner (dependencias)
+        run: |
+          docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner:latest \
+            scan source -r /src --format sarif --output /src/osv.sarif || true
+      - name: "Checkov (IaC — Bicep, Dockerfile)"
+        run: |
+          pip install --quiet checkov
+          checkov -d . --framework bicep dockerfile --output sarif \
+            --output-file-path checkov-out --soft-fail --quiet || true
+          [ -f checkov-out/results_sarif.sarif ] && mv checkov-out/results_sarif.sarif checkov.sarif || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sarif-ag03
+          path: "*.sarif"
+          if-no-files-found: warn
+
+  ag01-consolidar:
+    name: AG-01 Consolidar e informar
+    needs: [ag02-code-reviewer, ag03-dependency-iac]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sarif-*
+          path: sarif
+      - name: Consolidar hallazgos
+        env:
+          RUN_ID: run-${{ github.run_id }}
+        run: |
+          python scripts/consolidar.py sarif informe
+          cat informe/resumen.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: informe-ag01
+          path: informe/
+          retention-days: 30

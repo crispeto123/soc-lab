@@ -1,0 +1,13 @@
+{
+  "name": "api-node-vibecoded",
+  "version": "1.0.0",
+  "description": "App vulnerable a propósito para el laboratorio",
+  "main": "server.js",
+  "dependencies": {
+    "express": "4.16.0",
+    "lodash": "4.17.15",
+    "mysql": "2.15.0",
+    "jsonwebtoken": "8.5.1",
+    "axios": "0.21.0"
+  }
+}
