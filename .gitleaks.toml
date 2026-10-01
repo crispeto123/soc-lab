@@ -1,0 +1,17 @@
+# AG-02 — reglas de secretos (extiende las reglas por defecto de Gitleaks)
+title = "SOC Lab — secretos en apps vibecoded"
+
+[extend]
+useDefault = true
+
+# Contraseñas, secretos y llaves asignadas en código o archivos .env
+[[rules]]
+id = "soc-hardcoded-credential"
+description = "Credencial hardcodeada (password/secret/key/token asignado a un literal)"
+regex = '''(?i)(?:password|passwd|pwd|secret|secret_key|jwt_secret|api_key|apikey|token|db_pass\w*)["']?\s*[:=]\s*["']?([^"'\s]{6,})["']?'''
+secretGroup = 1
+entropy = 2.5
+keywords = ["password", "passwd", "pwd", "secret", "api_key", "apikey", "token", "db_pass"]
+
+[rules.allowlist]
+regexes = ['''(?i)(changeme|example|placeholder|\$\{|process\.env|os\.environ|getenv)''']

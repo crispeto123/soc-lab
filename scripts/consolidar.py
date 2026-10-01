@@ -86,6 +86,24 @@ def category(tool, rule_id, base):
     return base
 
 
+PKG_TRIVY = re.compile(r"Package:\s*(\S+)\s+Installed Version:\s*(\S+)", re.S)
+PKG_OSV = re.compile(r"Package '(?:[^'/]+/)?([^'@]+)@([^']+)'")
+FIX_RE = re.compile(r"Fixed Version:\s*([^\s,]+)|[Ff]ixed in (?:version )?v?([0-9][\w.\-]*)")
+
+
+def package_info(msg, rule):
+    """Extrae paquete, versión instalada y versión corregida (Trivy / OSV-Scanner)."""
+    text = msg + "\n" + ((rule.get("help") or {}).get("text") or "")
+    m = PKG_TRIVY.search(text) or PKG_OSV.search(text)
+    fx = FIX_RE.search(text)
+    return ((m.group(1).lower(), m.group(2)) if m else ("", "")) + \
+        ((fx.group(1) or fx.group(2)) if fx else "",)
+
+
+def vkey(v):
+    return [int(x) if x.isdigit() else 0 for x in re.split(r"[.\-+]", v or "0")]
+
+
 def parse(path):
     with open(path, encoding="utf-8") as f:
         sarif = json.load(f)
@@ -107,12 +125,14 @@ def parse(path):
             if cat == "secret":
                 cvss = max(cvss, 9.0)  # G7: todo secreto expuesto es P1
             vid = VULN_RE.search(f"{title} {rule_id} {msg}")
+            pkg, inst, fixed = package_info(msg, rule)
             yield {
                 "source_agent": agent,
                 "tool": tool,
                 "category": cat,
                 "rule": rule_id,
                 "vuln_id": vid.group(0) if vid else "",
+                "package": pkg, "installed": inst, "fixed": fixed,
                 "title": title,
                 "cwe": cwe,
                 "owasp": owasp,
@@ -135,7 +155,9 @@ def main():
         try:
             for f in parse(path):
                 # Dedup: misma ubicación + misma familia (CWE o regla)
-                if f["category"] == "dependency" and f["vuln_id"]:
+                if f["category"] == "secret":
+                    key = ("secret", f["location"])  # misma llave, distinta herramienta
+                elif f["category"] == "dependency" and f["vuln_id"]:
                     key = (f["location"].split(":")[0], f["vuln_id"])  # mismo CVE en el mismo manifiesto
                 else:
                     key = (f["location"], f["cwe"] or f["rule"])
@@ -143,6 +165,9 @@ def main():
                     prev = seen[key]
                     prev["tools"] = sorted(set(prev["tools"]) | {f["tool"]})
                     prev["cvss"] = max(prev["cvss"], f["cvss"])
+                    for k in ("package", "installed", "fixed"):
+                        if f.get(k) and (not prev.get(k) or (k == "fixed" and vkey(f[k]) > vkey(prev[k]))):
+                            prev[k] = f[k]
                     continue
                 f["tools"] = [f["tool"]]
                 seen[key] = f
@@ -158,7 +183,23 @@ def main():
         f["status"] = "nuevo"
         f.pop("tool", None)
 
-    doc = {"run_id": run_id, "repo": repo, "commit": commit,
+    # Plan de actualización: agrupa CVEs por paquete y manifiesto
+    plan = {}
+    for f in findings:
+        if f["category"] != "dependency" or not f.get("package"):
+            continue
+        k = (f["package"], f["location"].split(":")[0])
+        p = plan.setdefault(k, {"package": f["package"], "manifest": k[1], "installed": f["installed"],
+                                "fix_to": "", "cves": [], "max_cvss": 0, "priority": "P4"})
+        p["cves"].append(f["vuln_id"] or f["rule"])
+        if f["cvss"] > p["max_cvss"]:
+            p["max_cvss"], p["priority"] = f["cvss"], f["priority"]
+        if f.get("fixed") and vkey(f["fixed"]) > vkey(p["fix_to"]):
+            p["fix_to"] = f["fixed"]
+    packages = sorted(plan.values(), key=lambda p: (-p["max_cvss"], -len(p["cves"])))
+    sin_pkg = sum(1 for f in findings if f["category"] == "dependency" and not f.get("package"))
+
+    doc = {"run_id": run_id, "packages": packages, "repo": repo, "commit": commit,
            "generated_at": dt.datetime.utcnow().isoformat() + "Z",
            "errors": errores, "findings": findings}
     with open(os.path.join(out, "findings.json"), "w", encoding="utf-8") as fh:
@@ -177,6 +218,15 @@ def main():
     for f in findings[:15]:
         t = f["title"].replace("|", "/")[:80]
         lines.append(f"| {f['id']} | {f['priority']} | {f['cvss']} | {f['category']} | {t} | `{f['location']}` | {', '.join(f['tools'])} |")
+    if packages:
+        lines += ["", "## Plan de actualización por paquete", "",
+                  f"{len(packages)} paquete(s) concentran {sum(len(p['cves']) for p in packages)} CVEs.", "",
+                  "| Paquete | Manifiesto | Versión | Actualizar a | CVEs | CVSS máx | P |", "|---|---|---|---|---|---|---|"]
+        for p in packages[:20]:
+            lines.append(f"| {p['package']} | `{p['manifest']}` | {p['installed']} | {p['fix_to'] or 'revisar'} | "
+                         f"{len(p['cves'])} | {p['max_cvss']} | {p['priority']} |")
+        if sin_pkg:
+            lines.append(f"\n_{sin_pkg} hallazgos de dependencias sin paquete identificado (ver findings.json)._")
     if errores:
         lines += ["", "## Salidas descartadas", ""] + [f"- {e}" for e in errores]
     escalar = [f for f in findings if f["priority"] == "P1" or f["category"] == "secret"]
