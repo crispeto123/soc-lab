@@ -22,6 +22,7 @@ TOOLS = {
     "checkov": ("AG-03", "iac"),
 }
 LEVEL_CVSS = {"error": 7.5, "warning": 5.0, "note": 3.0, "none": 0.0}
+VULN_RE = re.compile(r"CVE-\d{4}-\d+|GHSA(?:-[a-z0-9]{4}){3}")
 PRIO = [(9.0, "P1"), (7.0, "P2"), (4.0, "P3"), (0.0, "P4")]
 # Valor tras '=' o ':' (asignaciones) o tokens largos con letras y dígitos
 ASSIGN_RE = re.compile(r"""(?i)((?:key|secret|token|pass(?:word)?|pwd|api[_-]?key)[\w-]*\s*[:=]\s*["']?)([^"'\s,;)]{4,})""")
@@ -95,7 +96,7 @@ def parse(path):
             rule_id = r.get("ruleId") or ""
             rule = rule_meta(run, rule_id, r.get("ruleIndex"))
             loc = (r.get("locations") or [{}])[0].get("physicalLocation", {})
-            uri = loc.get("artifactLocation", {}).get("uri", "")
+            uri = re.sub(r"^(file://)?/(src|repo)/", "", loc.get("artifactLocation", {}).get("uri", ""))
             line = (loc.get("region") or {}).get("startLine", 0)
             snippet = ((loc.get("region") or {}).get("snippet") or {}).get("text", "")
             cvss = round(score(r, rule, 5.0 if tool == 'checkov' else None), 1)  # Checkov no trae severidad
@@ -104,12 +105,14 @@ def parse(path):
             msg = (r.get("message") or {}).get("text", "")
             title = (rule.get("shortDescription") or {}).get("text") or msg.split("\n")[0][:120] or rule_id
             if cat == "secret":
-                cvss = max(cvss, 8.0)
+                cvss = max(cvss, 9.0)  # G7: todo secreto expuesto es P1
+            vid = VULN_RE.search(f"{title} {rule_id} {msg}")
             yield {
                 "source_agent": agent,
                 "tool": tool,
                 "category": cat,
                 "rule": rule_id,
+                "vuln_id": vid.group(0) if vid else "",
                 "title": title,
                 "cwe": cwe,
                 "owasp": owasp,
@@ -132,7 +135,10 @@ def main():
         try:
             for f in parse(path):
                 # Dedup: misma ubicación + misma familia (CWE o regla)
-                key = (f["location"], f["cwe"] or f["rule"])
+                if f["category"] == "dependency" and f["vuln_id"]:
+                    key = (f["location"].split(":")[0], f["vuln_id"])  # mismo CVE en el mismo manifiesto
+                else:
+                    key = (f["location"], f["cwe"] or f["rule"])
                 if key in seen:
                     prev = seen[key]
                     prev["tools"] = sorted(set(prev["tools"]) | {f["tool"]})
