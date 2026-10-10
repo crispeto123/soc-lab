@@ -97,7 +97,7 @@ def package_info(msg, rule):
     m = PKG_TRIVY.search(text) or PKG_OSV.search(text)
     fx = FIX_RE.search(text)
     return ((m.group(1).lower(), m.group(2)) if m else ("", "")) + \
-        ((fx.group(1) or fx.group(2)) if fx else "",)
+        ((fx.group(1) or fx.group(2)).rstrip(".") if fx else "",)
 
 
 def vkey(v):
