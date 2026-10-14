@@ -121,17 +121,23 @@ jobs:
             --out "$OUT/secrets.json" || true
 
       # ---------- Fase activa ----------
-      # ZAP full scan = spider + ajax spider (para SPAs) + escaneo ACTIVO.
-      # -j ajax spider (Juice Shop es Angular) · -m 3 spider 3 min · -T 25 tope total · -I no fallar.
-      # Perfil activo: seguro contra Juice Shop local; en producción requiere calibración (ADR-004).
-      - name: OWASP ZAP full scan (activo)  [T9, T10, inyecciones, params]
+      # ZAP full scan = spider + escaneo ACTIVO, acotado en tiempo para caber en el runner.
+      #   -m 2                         spider tradicional 2 min
+      #   maxScanDurationInMins=12     el active scan se corta a 12 min y escribe el reporte
+      #   maxRuleDurationInMins=2      ninguna regla individual se cuelga > 2 min
+      #   timeout 18m (externo)        colchón duro: si ZAP se pasa igual, se mata y el pipeline sigue
+      # Sin ajax spider: en Juice Shop (Angular) es demasiado pesado para el runner; en producción
+      # (Container Apps Jobs, sin límite de GitHub) se puede reactivar con -j. Perfil activo: seguro
+      # contra Juice Shop local; contra apps de clientes requiere su autorización (ADR-004).
+      - name: OWASP ZAP full scan (activo, acotado)  [T9, T10, inyecciones, params]
         if: ${{ inputs.active_scan }}
         continue-on-error: true
         run: |
-          docker run --rm --network host -v "$OUT":/zap/wrk:rw \
+          timeout 18m docker run --rm --network host -v "$OUT":/zap/wrk:rw \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-full-scan.py -t "${{ steps.target.outputs.target }}" \
-            -J zap.json -r zap.html -I -j -m 3 -T 25 || true
+            -J zap.json -r zap.html -I -m 2 \
+            -z "-config ascan.maxScanDurationInMins=12 -config ascan.maxRuleDurationInMins=2" || true
           ls -la "$OUT" || true
 
       - name: Nuclei  [T11 TRACE, T12 smuggling, misconfig]
