@@ -44,16 +44,15 @@ jobs:
     name: AG-06 Escaneo DAST
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      OUT: ${{ runner.temp }}/dast
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Preparar entorno
         run: |
-          mkdir -p "$OUT"
-          chmod -R 777 "$OUT"
+          echo "OUT=$RUNNER_TEMP/dast" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/dast"
+          chmod -R 777 "$RUNNER_TEMP/dast"
           echo "Modo: ${{ inputs.target_mode }}"
 
       # ---------- Resolver objetivo, levantar app y GATE de propiedad ----------
