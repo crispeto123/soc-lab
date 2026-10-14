@@ -43,7 +43,7 @@ jobs:
   ag06-dast:
     name: AG-06 Escaneo DAST
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -121,13 +121,17 @@ jobs:
             --out "$OUT/secrets.json" || true
 
       # ---------- Fase activa ----------
-      - name: OWASP ZAP baseline  [T9, T10, headers, cookies]
+      # ZAP full scan = spider + ajax spider (para SPAs) + escaneo ACTIVO.
+      # -j ajax spider (Juice Shop es Angular) · -m 3 spider 3 min · -T 25 tope total · -I no fallar.
+      # Perfil activo: seguro contra Juice Shop local; en producción requiere calibración (ADR-004).
+      - name: OWASP ZAP full scan (activo)  [T9, T10, inyecciones, params]
         if: ${{ inputs.active_scan }}
         continue-on-error: true
         run: |
           docker run --rm --network host -v "$OUT":/zap/wrk:rw \
             ghcr.io/zaproxy/zaproxy:stable \
-            zap-baseline.py -t "${{ steps.target.outputs.target }}" -J zap.json -r zap.html -I || true
+            zap-full-scan.py -t "${{ steps.target.outputs.target }}" \
+            -J zap.json -r zap.html -I -j -m 3 -T 25 || true
           ls -la "$OUT" || true
 
       - name: Nuclei  [T11 TRACE, T12 smuggling, misconfig]
