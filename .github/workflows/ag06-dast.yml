@@ -1,0 +1,182 @@
+# AG-06 DAST — Lab costo cero (ADR-002)
+# Ejecuta pruebas dinámicas de seguridad con un GATE de verificación de propiedad
+# obligatorio antes de cualquier prueba activa. Perfil no destructivo.
+#
+# Modos de objetivo:
+#   lab      -> levanta OWASP Juice Shop en el propio runner (localhost). Sin gate (es nuestro).
+#   external -> URL propia/autorizada. EXIGE token en /.well-known/soc-verify.txt antes de escanear.
+#
+# NUNCA se dispara solo contra terceros: solo workflow_dispatch.
+name: AG-06 DAST
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_mode:
+        description: "lab (Juice Shop local) o external (URL propia verificada)"
+        type: choice
+        options: [lab, external]
+        default: lab
+      target_url:
+        description: "URL objetivo (solo external). Ej: https://miapp.example"
+        required: false
+        default: ""
+      verify_token:
+        description: "Token esperado en /.well-known/soc-verify.txt (solo external)"
+        required: false
+        default: ""
+      active_scan:
+        description: "Incluir fase activa no destructiva (ZAP active + Nuclei)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read            # solo lee el repo; no escribe nada
+  actions: read
+
+concurrency:
+  group: ag06-dast
+  cancel-in-progress: false
+
+jobs:
+  ag06-dast:
+    name: AG-06 Escaneo DAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Juice Shop como servicio solo tiene sentido en modo lab, pero levantarlo
+    # siempre es inofensivo; el gate decide a qué URL se apunta.
+    services:
+      juiceshop:
+        image: bkimminich/juice-shop:latest
+        ports:
+          - 3000:3000
+
+    env:
+      RUNNER_TEMP_OUT: ${{ runner.temp }}/dast
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar entorno
+        run: |
+          mkdir -p "$RUNNER_TEMP_OUT"
+          echo "MODE=${{ inputs.target_mode }}"
+
+      # ---------- Resolver objetivo y GATE de propiedad (G1, G2, G4, G5) ----------
+      - name: Resolver objetivo y verificar propiedad
+        id: target
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.target_mode }}"
+
+          if [ "$MODE" = "lab" ]; then
+            # Espera a que Juice Shop responda en el runner
+            for i in $(seq 1 30); do
+              if curl -fsS "http://localhost:3000/" >/dev/null 2>&1; then break; fi
+              sleep 2
+            done
+            echo "target=http://localhost:3000" >> "$GITHUB_OUTPUT"
+            echo "host=localhost" >> "$GITHUB_OUTPUT"
+            echo "Objetivo Lab: Juice Shop en localhost:3000"
+            exit 0
+          fi
+
+          # --- modo external ---
+          URL="${{ inputs.target_url }}"
+          TOKEN="${{ inputs.verify_token }}"
+          if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
+            echo "::error::En modo external se requieren target_url y verify_token."; exit 1
+          fi
+
+          HOST=$(echo "$URL" | sed -E 's#^https?://##; s#/.*$##')
+
+          # G4: bloquear objetivos prohibidos (anti-SSRF)
+          case "$HOST" in
+            localhost|127.*|10.*|192.168.*|169.254.169.254|*.local|0.0.0.0)
+              echo "::error::Objetivo prohibido ($HOST). Bloqueado por G4."; exit 1;;
+          esac
+          if echo "$HOST" | grep -qE '^172\.(1[6-9]|2[0-9]|3[0-1])\.'; then
+            echo "::error::Rango privado 172.16/12 bloqueado por G4."; exit 1
+          fi
+
+          # G1/G2: verificar propiedad vía /.well-known/soc-verify.txt
+          GOT=$(curl -fsS --max-time 15 "https://$HOST/.well-known/soc-verify.txt" 2>/dev/null | tr -d '[:space:]' || true)
+          if [ "$GOT" != "$TOKEN" ]; then
+            echo "::error::Verificación de propiedad FALLIDA para $HOST. Sin propiedad verificada no se escanea (G1)."
+            exit 1
+          fi
+          echo "Propiedad verificada para $HOST."
+          echo "target=$URL" >> "$GITHUB_OUTPUT"
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+
+      # ---------- Fase pasiva ----------
+      - name: testssl.sh (TLS / cifrados / CAA)  [T13, T14]
+        if: steps.target.outputs.host != 'localhost'
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/testssl/testssl.sh.git "$RUNNER_TEMP/testssl"
+          "$RUNNER_TEMP/testssl/testssl.sh" --jsonfile "$RUNNER_TEMP_OUT/testssl.json" \
+            --protocols --cipher-categories --headers "${{ steps.target.outputs.host }}" || true
+
+      - name: Detección de secretos en JS público  [T6]
+        continue-on-error: true
+        run: |
+          python scripts/dast_logic.py secrets \
+            --target "${{ steps.target.outputs.target }}" \
+            --out "$RUNNER_TEMP_OUT/secrets.json" || true
+
+      # ---------- Fase activa no destructiva ----------
+      - name: OWASP ZAP baseline  [T9, T10, headers, cookies]
+        continue-on-error: true
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ steps.target.outputs.target }}
+          cmd_options: "-J zap.json -r zap.html"
+          allow_issue_writing: false
+          fail_action: false
+
+      - name: Recoger salida de ZAP
+        continue-on-error: true
+        run: |
+          [ -f zap.json ] && cp zap.json "$RUNNER_TEMP_OUT/zap.json" || true
+          [ -f zap.html ] && cp zap.html "$RUNNER_TEMP_OUT/zap.html" || true
+
+      - name: Nuclei  [T11 TRACE, T12 smuggling, fingerprint, misconfig]
+        if: ${{ inputs.active_scan }}
+        continue-on-error: true
+        run: |
+          curl -fsSL -o /tmp/nuclei.zip \
+            https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_linux_amd64.zip || true
+          if [ -f /tmp/nuclei.zip ]; then
+            unzip -o /tmp/nuclei.zip -d /tmp/nuclei >/dev/null
+            /tmp/nuclei/nuclei -u "${{ steps.target.outputs.target }}" \
+              -tags misconfiguration,exposure,http-trace,request-smuggling,ssl \
+              -jsonl -o "$RUNNER_TEMP_OUT/nuclei.jsonl" -rate-limit 20 -silent || true
+          fi
+
+      # ---------- Lógica de negocio ----------
+      - name: Pruebas de lógica (rate limit, enumeración, OTP, CAPTCHA)  [T1-T5, T7]
+        if: ${{ inputs.active_scan }}
+        continue-on-error: true
+        run: |
+          python scripts/dast_logic.py logic \
+            --target "${{ steps.target.outputs.target }}" \
+            --out "$RUNNER_TEMP_OUT/logic.json" || true
+
+      # ---------- Consolidación ----------
+      - name: Consolidar hallazgos -> findings.json
+        run: |
+          python scripts/dast_consolidar.py "$RUNNER_TEMP_OUT" \
+            --target "${{ steps.target.outputs.target }}" \
+            --mode "${{ inputs.target_mode }}" \
+            --out "$RUNNER_TEMP_OUT/findings.json" \
+            --summary "$RUNNER_TEMP_OUT/informe-dast.md"
+          cat "$RUNNER_TEMP_OUT/informe-dast.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: informe-ag06
+          path: ${{ runner.temp }}/dast
+          retention-days: 14
