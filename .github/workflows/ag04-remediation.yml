@@ -1,0 +1,77 @@
+# AG-04 Remediation — Lab costo cero (ADR-002)
+# ADR-001 v1.1: abre un PR por paquete en ramas soc/fix-*; nunca hace merge.
+# La aprobación humana es la revisión y el merge del PR (branch protection en main).
+name: AG-04 Remediation
+
+on:
+  workflow_run:
+    workflows: ["AG-01 Orquestador"]
+    types: [completed]
+    branches: [main]            # solo ejecuciones de AG-01 sobre main (no PRs)
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID del run de AG-01 (vacío = último exitoso en main)"
+        required: false
+      dry_run:
+        description: "Solo simular (no abre PRs)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write               # C1: push solo a ramas soc/fix-* (lo garantiza el script)
+  pull-requests: write          # abrir / cerrar PRs propios
+  issues: write                 # crear etiquetas
+  actions: read                 # descargar el informe de AG-01
+
+concurrency:
+  group: ag04-remediation
+  cancel-in-progress: false
+
+env:
+  MAX_OPEN_PRS: "5"             # C4
+
+jobs:
+  ag04-remediar:
+    name: AG-04 Remediar dependencias
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolver ejecución de AG-01
+        id: src
+        run: |
+          RID="${{ github.event.workflow_run.id }}"
+          [ -z "$RID" ] && RID="${{ inputs.run_id }}"
+          if [ -z "$RID" ]; then
+            RID=$(gh run list --workflow "AG-01 Orquestador" --branch main --status success \
+                  --limit 1 --json databaseId --jq '.[0].databaseId')
+          fi
+          echo "Origen: run $RID"
+          echo "run_id=$RID" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: informe-ag01
+          path: ${{ runner.temp }}/informe     # fuera del repo: nunca se commitea
+          run-id: ${{ steps.src.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Abrir PRs de remediación
+        run: |
+          python scripts/remediar.py "$RUNNER_TEMP/informe/findings.json" \
+            --max-open "$MAX_OPEN_PRS" --stale-days 14 \
+            --summary "$RUNNER_TEMP/remediacion.md" \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+          cat "$RUNNER_TEMP/remediacion.md" >> "$GITHUB_STEP_SUMMARY"
