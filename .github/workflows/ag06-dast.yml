@@ -6,8 +6,13 @@
 #   lab      -> levanta OWASP Juice Shop en el propio runner (localhost). Sin gate (es nuestro).
 #   external -> URL propia/autorizada. EXIGE token en /.well-known/soc-verify.txt antes de escanear.
 #
-# Todo corre en el runner con red host, así localhost:3000 es consistente para
-# Juice Shop, ZAP, Nuclei y los scripts. NUNCA se dispara solo: solo workflow_dispatch.
+# v1.0.1 (15-oct-2026):
+#   - Inputs y salidas por env: (nunca ${{ }} dentro de run:) -> corrige run-shell-injection.
+#   - target_url validada con regex estricta (solo https, sin credenciales ni caracteres de shell).
+#   - verify_token validado (16-128 caracteres [A-Za-z0-9_-]).
+#   - Anti-SSRF (G4) reforzado: normaliza host (minúsculas, sin puerto) y resuelve DNS;
+#     bloquea si CUALQUIER IP es privada, loopback, link-local, reservada o metadata.
+#   - runs-on fijado a ubuntu-24.04 (migración de ubuntu-latest a Ubuntu 26 el 19-oct).
 name: AG-06 DAST
 
 on:
@@ -19,10 +24,10 @@ on:
         options: [lab, external]
         default: lab
       target_url:
-        description: "URL objetivo (solo external). Ej: https://miapp.example"
+        description: "URL objetivo (solo external, https). Ej: https://miapp.example"
         required: false
         default: ""
-      verify_token:
+      verify_token:  # gitleaks:allow — nombre del input; el valor se publica en /.well-known, no es un secreto
         description: "Token esperado en /.well-known/soc-verify.txt (solo external)"
         required: false
         default: ""
@@ -42,8 +47,12 @@ concurrency:
 jobs:
   ag06-dast:
     name: AG-06 Escaneo DAST
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      IN_MODE: ${{ inputs.target_mode }}
+      IN_URL: ${{ inputs.target_url }}
+      IN_TOKEN: ${{ inputs.verify_token }}
 
     steps:
       - uses: actions/checkout@v4
@@ -53,16 +62,18 @@ jobs:
           echo "OUT=$RUNNER_TEMP/dast" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/dast"
           chmod -R 777 "$RUNNER_TEMP/dast"
-          echo "Modo: ${{ inputs.target_mode }}"
+          case "$IN_MODE" in
+            lab|external) echo "Modo: $IN_MODE" ;;
+            *) echo "::error::target_mode inválido"; exit 1 ;;
+          esac
 
       # ---------- Resolver objetivo, levantar app y GATE de propiedad ----------
       - name: Resolver objetivo y verificar propiedad
         id: target
         run: |
           set -euo pipefail
-          MODE="${{ inputs.target_mode }}"
 
-          if [ "$MODE" = "lab" ]; then
+          if [ "$IN_MODE" = "lab" ]; then
             echo "Levantando OWASP Juice Shop..."
             docker run -d --name juiceshop -p 3000:3000 bkimminich/juice-shop:latest
             echo "Esperando a que responda (hasta 3 min)..."
@@ -72,36 +83,62 @@ jobs:
               fi
               sleep 3
             done
-            echo "target=http://localhost:3000" >> "$GITHUB_OUTPUT"
+            {
+              echo "TARGET=http://localhost:3000"
+              echo "TARGET_HOST=localhost:3000"
+            } >> "$GITHUB_ENV"
             echo "host=localhost" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           # --- modo external ---
-          URL="${{ inputs.target_url }}"
-          TOKEN="${{ inputs.verify_token }}"
-          if [ -z "$URL" ] || [ -z "$TOKEN" ]; then
+          if [ -z "$IN_URL" ] || [ -z "$IN_TOKEN" ]; then
             echo "::error::En modo external se requieren target_url y verify_token."; exit 1
           fi
-          HOST=$(echo "$URL" | sed -E 's#^https?://##; s#/.*$##')
 
-          # Bloqueo anti-SSRF (G4)
-          case "$HOST" in
-            localhost|127.*|10.*|192.168.*|169.254.169.254|*.local|0.0.0.0)
-              echo "::error::Objetivo prohibido ($HOST). Bloqueado por G4."; exit 1;;
-          esac
-          if echo "$HOST" | grep -qE '^172\.(1[6-9]|2[0-9]|3[0-1])\.'; then
-            echo "::error::Rango privado 172.16/12 bloqueado por G4."; exit 1
+          # Formato estricto: solo https, host DNS, puerto opcional, ruta simple.
+          # Sin '@', espacios, comillas, '$', ';', '`', '|', '&', saltos de línea ni query string.
+          URL_RE='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
+          if ! [[ "$IN_URL" =~ $URL_RE ]]; then
+            echo "::error::target_url con formato no permitido (solo https://host[:puerto][/ruta])."; exit 1
+          fi
+          if ! [[ "$IN_TOKEN" =~ ^[A-Za-z0-9_-]{16,128}$ ]]; then
+            echo "::error::verify_token con formato no permitido (16-128 caracteres A-Z a-z 0-9 _ -)."; exit 1
           fi
 
-          # Verificación de propiedad (G1/G2)
-          GOT=$(curl -fsS --max-time 15 "https://$HOST/.well-known/soc-verify.txt" 2>/dev/null | tr -d '[:space:]' || true)
-          if [ "$GOT" != "$TOKEN" ]; then
+          HOSTPORT="${IN_URL#https://}"; HOSTPORT="${HOSTPORT%%/*}"
+          HOST="${HOSTPORT%%:*}"; HOST="${HOST,,}"; HOST="${HOST%.}"
+
+          # Anti-SSRF (G4) — nombres prohibidos
+          case "$HOST" in
+            localhost|*.localhost|*.local|*.internal|*.home.arpa|metadata|metadata.*)
+              echo "::error::Objetivo prohibido ($HOST). Bloqueado por G4."; exit 1;;
+          esac
+
+          # Anti-SSRF (G4) — todas las IPs a las que resuelve deben ser públicas
+          IPS=$(getent ahosts "$HOST" | awk '{print $1}' | sort -u || true)
+          if [ -z "$IPS" ]; then
+            echo "::error::$HOST no resuelve en DNS."; exit 1
+          fi
+          for ip in $IPS; do
+            if python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); sys.exit(0 if (a.is_private or a.is_loopback or a.is_link_local or a.is_reserved or a.is_multicast or a.is_unspecified) else 1)' "$ip"; then
+              echo "::error::$HOST resuelve a una IP no pública ($ip). Bloqueado por G4."; exit 1
+            fi
+          done
+          echo "IPs verificadas (públicas): $(echo $IPS | tr '\n' ' ')"
+
+          # Verificación de propiedad (G1/G2) — sin seguir redirecciones
+          GOT=$(curl -fsS --max-time 15 --max-filesize 4096 --proto '=https' \
+                "https://$HOSTPORT/.well-known/soc-verify.txt" 2>/dev/null | tr -d '[:space:]' || true)
+          if [ "$GOT" != "$IN_TOKEN" ]; then
             echo "::error::Verificación de propiedad FALLIDA para $HOST. Sin propiedad verificada no se escanea (G1)."
             exit 1
           fi
           echo "Propiedad verificada para $HOST."
-          echo "target=$URL" >> "$GITHUB_OUTPUT"
+          {
+            echo "TARGET=$IN_URL"
+            echo "TARGET_HOST=$HOSTPORT"
+          } >> "$GITHUB_ENV"
           echo "host=$HOST" >> "$GITHUB_OUTPUT"
 
       # ---------- Fase pasiva ----------
@@ -111,13 +148,13 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/testssl/testssl.sh.git /tmp/testssl
           /tmp/testssl/testssl.sh --jsonfile "$OUT/testssl.json" \
-            --protocols --cipher-categories --headers "${{ steps.target.outputs.host }}" || true
+            --protocols --cipher-categories --headers "$TARGET_HOST" || true
 
       - name: Detección de secretos en JS público  [T6]
         continue-on-error: true
         run: |
           python3 scripts/dast_logic.py secrets \
-            --target "${{ steps.target.outputs.target }}" \
+            --target "$TARGET" \
             --out "$OUT/secrets.json" || true
 
       # ---------- Fase activa ----------
@@ -135,7 +172,7 @@ jobs:
         run: |
           timeout 18m docker run --rm --network host -v "$OUT":/zap/wrk:rw \
             ghcr.io/zaproxy/zaproxy:stable \
-            zap-full-scan.py -t "${{ steps.target.outputs.target }}" \
+            zap-full-scan.py -t "$TARGET" \
             -J zap.json -r zap.html -I -m 2 \
             -z "-config ascan.maxScanDurationInMins=12 -config ascan.maxRuleDurationInMins=2" || true
           ls -la "$OUT" || true
@@ -151,7 +188,7 @@ jobs:
               "https://github.com/projectdiscovery/nuclei/releases/download/v${NV}/nuclei_${NV}_linux_amd64.zip" || true
             unzip -o /tmp/nuclei.zip -d /tmp/nuclei >/dev/null 2>&1 || true
             if [ -x /tmp/nuclei/nuclei ]; then
-              /tmp/nuclei/nuclei -u "${{ steps.target.outputs.target }}" \
+              /tmp/nuclei/nuclei -u "$TARGET" \
                 -severity low,medium,high,critical -rate-limit 30 -timeout 5 \
                 -jsonl -o "$OUT/nuclei.jsonl" -silent || true
             fi
@@ -163,15 +200,15 @@ jobs:
         continue-on-error: true
         run: |
           python3 scripts/dast_logic.py logic \
-            --target "${{ steps.target.outputs.target }}" \
+            --target "$TARGET" \
             --out "$OUT/logic.json" || true
 
       # ---------- Consolidación ----------
       - name: Consolidar hallazgos -> findings.json
         run: |
           python3 scripts/dast_consolidar.py "$OUT" \
-            --target "${{ steps.target.outputs.target }}" \
-            --mode "${{ inputs.target_mode }}" \
+            --target "$TARGET" \
+            --mode "$IN_MODE" \
             --out "$OUT/findings.json" \
             --summary "$OUT/informe-dast.md"
           cat "$OUT/informe-dast.md" >> "$GITHUB_STEP_SUMMARY"
