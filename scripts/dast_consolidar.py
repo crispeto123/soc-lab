@@ -223,7 +223,9 @@ def main():
     a = ap.parse_args()
 
     rows = []
-    rows += from_zap(load_json(os.path.join(a.outdir, "zap.json")))
+    zap_data = load_json(os.path.join(a.outdir, "zap.json"))
+    zap_expected = os.path.exists(os.path.join(a.outdir, "zap.log"))
+    rows += from_zap(zap_data)
     rows += from_nuclei(load_jsonl(os.path.join(a.outdir, "nuclei.jsonl")))
     rows += from_testssl(load_json(os.path.join(a.outdir, "testssl.json")))
     rows += from_generic(os.path.join(a.outdir, "secrets.json"), "secrets")
@@ -247,7 +249,7 @@ def main():
         "run_id": run_id, "target": a.target, "mode": a.mode,
         "verified": a.mode == "external" or a.mode == "lab",
         "generated_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "count": len(rows), "noise_filtrado": noise_n, "fuera_de_alcance": scope_n, "findings": rows,
+        "count": len(rows), "zap_ok": bool(zap_data), "noise_filtrado": noise_n, "fuera_de_alcance": scope_n, "findings": rows,
     }
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2, ensure_ascii=False)
@@ -268,6 +270,9 @@ def main():
         lines += ["", f"_({noise_n} hallazgo(s) informativo(s) de ruido filtrados.)_"]
     if scope_n:
         lines += ["", f"_⚠️ {scope_n} hallazgo(s) de otros hosts descartados (fuera de alcance, G5)._"]
+    if zap_expected and not zap_data:
+        lines[2:2] = ["> ⚠️ **Escaneo INCOMPLETO:** ZAP no generó reporte (ver `zap.log` en el artefacto). "
+                      "Faltan inyecciones, XSS, cabeceras y configuración: este informe NO cubre la app completa.", ""]
     lines += ["", "_AG-06 opera en perfil no destructivo y solo sobre objetivos verificados (G1–G9)._"]
     with open(a.summary, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
