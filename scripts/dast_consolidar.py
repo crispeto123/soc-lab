@@ -45,6 +45,24 @@ NOISE_TITLES = (
 )
 
 
+def host_of(url):
+    from urllib.parse import urlparse
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def out_of_scope(row, target_host):
+    """G5: un hallazgo cuya ubicación es una URL de OTRO host no pertenece al objetivo
+    (p. ej. github.com enlazado desde la app). Ubicaciones sin URL (IP de testssl, etc.)
+    se conservan."""
+    loc = (row.get("location") or "").strip()
+    if not loc.lower().startswith(("http://", "https://")):
+        return False
+    return host_of(loc) != target_host
+
+
 def is_noise(row):
     t = (row.get("title") or "").lower()
     return any(n in t for n in NOISE_TITLES)
@@ -212,6 +230,9 @@ def main():
     rows += from_generic(os.path.join(a.outdir, "logic.json"), "logic")
 
     rows = dedup(rows)
+    target_host = host_of(a.target)
+    scope_n = sum(1 for r in rows if out_of_scope(r, target_host))
+    rows = [r for r in rows if not out_of_scope(r, target_host)]
     noise_n = sum(1 for r in rows if is_noise(r))
     rows = [r for r in rows if not is_noise(r)]
     run_id = "dast-" + dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d-%H%M")
@@ -226,7 +247,7 @@ def main():
         "run_id": run_id, "target": a.target, "mode": a.mode,
         "verified": a.mode == "external" or a.mode == "lab",
         "generated_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "count": len(rows), "noise_filtrado": noise_n, "findings": rows,
+        "count": len(rows), "noise_filtrado": noise_n, "fuera_de_alcance": scope_n, "findings": rows,
     }
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2, ensure_ascii=False)
@@ -245,6 +266,8 @@ def main():
                      f"{(r.get('title','') or '').replace('|','/')[:50]} | {r['source_tool']} | {loc} |")
     if noise_n:
         lines += ["", f"_({noise_n} hallazgo(s) informativo(s) de ruido filtrados.)_"]
+    if scope_n:
+        lines += ["", f"_⚠️ {scope_n} hallazgo(s) de otros hosts descartados (fuera de alcance, G5)._"]
     lines += ["", "_AG-06 opera en perfil no destructivo y solo sobre objetivos verificados (G1–G9)._"]
     with open(a.summary, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")

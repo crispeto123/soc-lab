@@ -26,6 +26,8 @@
 #   - Consolidación y artefacto con always(): siempre hay informe con lo disponible.
 #   - Job 55 min; timeout por paso.
 # v1.1.2 (17-oct-2026): límite del active scan con la clave correcta scanner.* (run #13 sin zap.json).
+# v1.1.3 (17-oct-2026): alcance G5 — contexto ZAP limitado al host objetivo (run #14 salió a github.com);
+#   el consolidador descarta hallazgos de otros hosts.
 name: AG-06 DAST
 
 on:
@@ -54,7 +56,7 @@ on:
         type: boolean
         default: true
       ajax_spider:
-        description: "AJAX spider en ZAP (necesario para SPAs Angular/React que exponen API /rest)"
+        description: "Spider de navegador en ZAP (Client spider, -j): necesario para SPAs Angular/React con API /rest"
         type: boolean
         default: true
       login_path:
@@ -257,13 +259,18 @@ jobs:
             fi
           fi
 
-      # ZAP full scan = spider + (opcional) AJAX spider + escaneo ACTIVO, acotado para el runner.
-      # Presupuesto v1.1.1 (run #12 duró 42,7 min con v1.1 y el job se canceló a los 45):
-      #   -m 3                         spider tradicional 3 min
-      #   -j + ajaxSpider.maxDuration=4  AJAX spider 4 min: recorre la SPA y descubre la API /rest
+      # ZAP full scan = spider + (opcional) spider de navegador + escaneo ACTIVO, acotado.
+      # v1.1.3 — ALCANCE (G5): sin archivo de contexto ZAP no restringe nada y el run #14
+      # navegó a github.com (8 hallazgos de terceros). Ahora se genera ag06.context con
+      # incregex = SOLO el host del objetivo y se pasa con -n. Spider, spider de navegador y
+      # active scan quedan limitados a ese contexto (verificado en zap_common.py de ZAP).
+      # Nota: en ZAP actual "-j" usa el Client spider (no el AJAX spider, que exige
+      # --ajax-spider). El Client spider fue el que descubrió /rest y /api en el run #14.
+      # Presupuesto:
+      #   -m 3                         spider tradicional y Client spider, 3 min cada uno
       #   -T 5                         máx. 5 min esperando arranque + escaneo pasivo
       #   scanner.maxScanDurationInMins=12  el active scan se corta a 12 min y escribe el reporte
-      #   maxRuleDurationInMins=2      ninguna regla individual > 2 min
+      #   scanner.maxRuleDurationInMins=2   ninguna regla individual > 2 min
       #   timeout 28m + docker kill    corte duro; el contenedor tiene nombre para matarlo seguro
       # Perfil activo: seguro contra Juice Shop local; contra apps de clientes exige su
       # autorización y propiedad verificada (ADR-004, gate previo).
@@ -274,19 +281,33 @@ jobs:
         env:
           IN_AJAX: ${{ inputs.ajax_spider }}
         run: |
+          # Contexto de alcance: solo el host[:puerto] del objetivo (TARGET_HOST viene del gate).
+          python3 - "$TARGET_HOST" "$OUT/ag06.context" <<'PY'
+          import re, sys
+          from xml.sax.saxutils import escape
+          hostport, out = sys.argv[1], sys.argv[2]
+          host, _, port = hostport.partition(":")
+          rx = "^https?://" + re.escape(host) + (r"(:" + port + ")?" if port else r"(:[0-9]+)?") + r"(/.*)?$"
+          open(out, "w", encoding="utf-8").write(
+              '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+              "<configuration><context><name>ag06</name><desc>AG-06 alcance</desc>"
+              "<inscope>true</inscope><incregexes>" + escape(rx) + "</incregexes>"
+              "</context></configuration>\n")
+          print("Alcance ZAP:", rx)
+          PY
+          chmod 666 "$OUT/ag06.context"
+
           # v1.1.2: la clave correcta es scanner.* (verificado en ScannerParam.java de ZAP).
-          # Con ascan.* ZAP ignoraba el límite: run #13 se cortó a los 28 min SIN escribir reporte.
           ZAP_Z="-config scanner.maxScanDurationInMins=12 -config scanner.maxRuleDurationInMins=2"
           ZAP_Z="$ZAP_Z -config scanner.threadPerHost=4"
-          AJAX_FLAG=""
+          BROWSER_FLAG=""
           if [ "$IN_AJAX" = "true" ]; then
-            AJAX_FLAG="-j"
-            ZAP_Z="$ZAP_Z -config ajaxSpider.maxDuration=4 -config ajaxSpider.browserId=firefox-headless"
+            BROWSER_FLAG="-j"   # Client spider (navegador) dentro del contexto
           fi
           timeout --kill-after=30s 28m docker run --rm --name ag06-zap --network host \
             -v "$OUT":/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable \
-            zap-full-scan.py -t "$TARGET" \
-            -J zap.json -r zap.html -I -m 3 -T 5 $AJAX_FLAG \
+            zap-full-scan.py -t "$TARGET" -n ag06.context \
+            -J zap.json -r zap.html -I -m 3 -T 5 $BROWSER_FLAG \
             -z "$ZAP_Z" || echo "::warning::ZAP no terminó dentro del presupuesto; se consolida lo disponible."
           docker kill ag06-zap >/dev/null 2>&1 || true
           ls -la "$OUT" || true
