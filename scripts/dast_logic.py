@@ -11,7 +11,7 @@ así que aquí se dejan como marcadores para ejecución asistida.
 
 Uso:
   python scripts/dast_logic.py secrets --target <url> --out secrets.json
-  python scripts/dast_logic.py logic   --target <url> --out logic.json
+  python scripts/dast_logic.py logic   --target <url> [--login-path /rest/user/login] --out logic.json
 """
 import argparse
 import json
@@ -19,6 +19,7 @@ import re
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 UA = "AG-06-DAST/1.0 (+autorizado)"
@@ -32,14 +33,21 @@ SECRET_PATTERNS = [
 ]
 
 
-def fetch(url, method="GET", headers=None, timeout=TIMEOUT):
-    req = urllib.request.Request(url, method=method, headers={"User-Agent": UA, **(headers or {})})
+def fetch(url, method="GET", headers=None, data=None, timeout=TIMEOUT):
+    body_bytes = data.encode("utf-8") if isinstance(data, str) else data
+    req = urllib.request.Request(url, method=method, data=body_bytes,
+                                 headers={"User-Agent": UA, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read(500000).decode("utf-8", "replace")
             return r.status, dict(r.headers), body
     except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers or {}), ""
+        # En login, un fallo de credenciales suele venir como 4xx CON cuerpo útil: lo leemos.
+        try:
+            ebody = e.read(500000).decode("utf-8", "replace")
+        except Exception:
+            ebody = ""
+        return e.code, dict(e.headers or {}), ebody
     except Exception:
         return None, {}, ""
 
@@ -49,14 +57,16 @@ def mask(v):
 
 
 def find_js(base, html):
-    urls = set()
+    """Extrae los .js del HTML. v1.1: resuelve rutas RELATIVAS ("main.js", "./assets/x.js"),
+    que es como Angular/Vite/Lovable cargan su bundle; v1.0 solo veía "http..." y "/...",
+    por eso el run #11 dio 0 secretos en Juice Shop. Solo sigue JS del MISMO host (alcance G5)."""
+    urls = []
+    base_host = urllib.parse.urlparse(base).netloc
     for m in re.finditer(r'src=["\']([^"\']+\.js[^"\']*)["\']', html):
-        src = m.group(1)
-        if src.startswith("http"):
-            urls.add(src)
-        elif src.startswith("/"):
-            urls.add(base.rstrip("/") + src)
-    return list(urls)[:25]
+        full = urllib.parse.urljoin(base.rstrip("/") + "/", m.group(1))
+        if urllib.parse.urlparse(full).netloc == base_host and full not in urls:
+            urls.append(full)
+    return urls[:25]
 
 
 def run_secrets(target, out):
@@ -84,10 +94,26 @@ def run_secrets(target, out):
     print(f"secrets: {len(uniq)} hallazgo(s)")
 
 
-def run_logic(target, out):
+def enum_probe(login_url, email):
+    """Un intento de login NO destructivo: email dado + password inválido fijo.
+    Nunca inicia sesión (la contraseña es basura) y es una sola solicitud por usuario.
+    Prueba JSON {email,password}; si el server no lo acepta, cae a form-urlencoded.
+    Devuelve (status, longitud_cuerpo, nº_palabras, extracto) para comparar respuestas."""
+    bad_pw = "Zz!invalid-ag06-000000"
+    payload = json.dumps({"email": email, "password": bad_pw})
+    status, _, body = fetch(login_url, method="POST", data=payload,
+                            headers={"Content-Type": "application/json", "Accept": "application/json"})
+    if status in (None, 404, 405, 415):  # endpoint no acepta JSON: intento form
+        form = urllib.parse.urlencode({"email": email, "username": email, "password": bad_pw})
+        status, _, body = fetch(login_url, method="POST", data=form,
+                                headers={"Content-Type": "application/x-www-form-urlencoded"})
+    return status, len(body or ""), len((body or "").split()), (body or "")[:120]
+
+
+def run_logic(target, out, login_path=None):
     findings = []
 
-    # T2/T3: rate limit. Ráfaga CORTA (no destructiva) y observa si aparece 429.
+    # T3: rate limit. Ráfaga CORTA (no destructiva) y observa si aparece 429.
     def one(_):
         return fetch(target, timeout=8)[0]
     with ThreadPoolExecutor(max_workers=10) as ex:
@@ -102,16 +128,49 @@ def run_logic(target, out):
             "status": "nuevo",
         })
 
-    # T5: enumeración. Compara respuesta a dos identificadores (válido-aparente vs control).
-    # Solo marca si las respuestas difieren de forma observable. Requiere endpoint; se deja
-    # como marcador cuando no hay endpoint de validación conocido.
-    findings.append({
-        "category": "logic", "title": "Enumeración de usuarios — requiere endpoint de validación del cliente",
-        "cwe": "CWE-204", "cvss": 0.0, "priority": "P4",
-        "location": target, "evidence": "Marcador: ejecutar diff de respuestas con IDs válido/inválido.",
-        "recommendation": "Unificar respuestas para IDs válidos e inválidos.",
-        "status": "informativo",
-    })
+    # T2/T5/T7: enumeración de usuarios. Compara la respuesta del login ante un usuario
+    # plausible vs uno inexistente, SIEMPRE con password inválido (nunca inicia sesión).
+    # Solo marca si la respuesta difiere de forma observable (código, longitud o mensaje).
+    if login_path:
+        login_url = target.rstrip("/") + "/" + login_path.lstrip("/")
+        host = urllib.parse.urlparse(target).hostname or "example.com"
+        likely = f"admin@{host}"                       # usuario plausible
+        bogus = "no-existe-ag06-9f3a2b@" + host         # usuario casi seguro inexistente
+        r_likely = enum_probe(login_url, likely)
+        r_bogus = enum_probe(login_url, bogus)
+        if r_likely[0] is not None and r_bogus[0] is not None:
+            diff_code = r_likely[0] != r_bogus[0]
+            diff_len = abs(r_likely[1] - r_bogus[1]) > 16
+            diff_words = abs(r_likely[2] - r_bogus[2]) > 4
+            if diff_code or diff_len or diff_words:
+                findings.append({
+                    "category": "logic",
+                    "title": "Posible enumeración de usuarios (respuestas de login divergentes)",
+                    "cwe": "CWE-204", "cvss": 5.3, "priority": "P2",
+                    "location": login_url,
+                    "evidence": (f"válido-aparente: HTTP {r_likely[0]}, {r_likely[1]}B | "
+                                 f"inexistente: HTTP {r_bogus[0]}, {r_bogus[1]}B"),
+                    "recommendation": "Unificar respuesta, código y tiempo para usuarios válidos e inexistentes.",
+                    "status": "confirmado",
+                })
+            else:
+                findings.append({
+                    "category": "logic",
+                    "title": "Login no enumera usuarios por respuesta (respuestas equivalentes)",
+                    "cwe": "CWE-204", "cvss": 0.0, "priority": "P4",
+                    "location": login_url,
+                    "evidence": f"Ambas respuestas equivalentes (~HTTP {r_likely[0]}, ~{r_likely[1]}B).",
+                    "recommendation": "Mantener respuestas unificadas; revisar también diferencias de tiempo.",
+                    "status": "informativo",
+                })
+    else:
+        findings.append({
+            "category": "logic", "title": "Enumeración de usuarios — no evaluada (sin login_path)",
+            "cwe": "CWE-204", "cvss": 0.0, "priority": "P4",
+            "location": target, "evidence": "Ejecutar con --login-path para evaluar T2/T5/T7.",
+            "recommendation": "Unificar respuestas para IDs válidos e inválidos.",
+            "status": "informativo",
+        })
 
     json.dump(findings, open(out, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     print(f"logic: {len(findings)} entrada(s)")
@@ -121,12 +180,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("op", choices=["secrets", "logic"])
     ap.add_argument("--target", required=True)
+    ap.add_argument("--login-path", dest="login_path", default=None,
+                    help="Ruta de login para la prueba de enumeración (ej: /rest/user/login)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     if a.op == "secrets":
         run_secrets(a.target, a.out)
     else:
-        run_logic(a.target, a.out)
+        run_logic(a.target, a.out, login_path=a.login_path)
 
 
 if __name__ == "__main__":

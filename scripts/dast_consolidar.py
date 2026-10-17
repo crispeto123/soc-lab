@@ -30,6 +30,25 @@ RULES = {
 
 PRIO_ORDER = {"P1": 0, "P2": 1, "P3": 2, "P4": 3}
 
+# Hallazgos puramente informativos de ZAP que no aportan a un informe de cliente.
+# Se descartan por título (coincidencia por substring, en minúsculas).
+NOISE_TITLES = (
+    "modern web application",
+    "user agent fuzzer",
+    "storable and cacheable content",
+    "storable but non-cacheable content",
+    "non-storable content",
+    "re-examine cache-control directives",
+    "information disclosure - suspicious comments",
+    "charset mismatch",
+    "retrieved from cache",
+)
+
+
+def is_noise(row):
+    t = (row.get("title") or "").lower()
+    return any(n in t for n in NOISE_TITLES)
+
 
 def prio_from_cvss(cvss):
     if cvss >= 7.0:
@@ -193,6 +212,8 @@ def main():
     rows += from_generic(os.path.join(a.outdir, "logic.json"), "logic")
 
     rows = dedup(rows)
+    noise_n = sum(1 for r in rows if is_noise(r))
+    rows = [r for r in rows if not is_noise(r)]
     run_id = "dast-" + dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d-%H%M")
     for i, r in enumerate(rows, 1):
         r["id"] = f"D-{i:04d}"
@@ -205,7 +226,7 @@ def main():
         "run_id": run_id, "target": a.target, "mode": a.mode,
         "verified": a.mode == "external" or a.mode == "lab",
         "generated_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "count": len(rows), "findings": rows,
+        "count": len(rows), "noise_filtrado": noise_n, "findings": rows,
     }
     with open(a.out, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2, ensure_ascii=False)
@@ -222,6 +243,8 @@ def main():
         loc = (r.get("location", "") or "").replace("|", "/")[:50]
         lines.append(f"| {r['id']} | {r['priority']} | {r.get('cwe','')} | "
                      f"{(r.get('title','') or '').replace('|','/')[:50]} | {r['source_tool']} | {loc} |")
+    if noise_n:
+        lines += ["", f"_({noise_n} hallazgo(s) informativo(s) de ruido filtrados.)_"]
     lines += ["", "_AG-06 opera en perfil no destructivo y solo sobre objetivos verificados (G1–G9)._"]
     with open(a.summary, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
