@@ -13,6 +13,14 @@
 #   - Anti-SSRF (G4) reforzado: normaliza host (minúsculas, sin puerto) y resuelve DNS;
 #     bloquea si CUALQUIER IP es privada, loopback, link-local, reservada o metadata.
 #   - runs-on fijado a ubuntu-24.04 (migración de ubuntu-latest a Ubuntu 26 el 19-oct).
+# v1.1 (17-oct-2026):
+#   - AJAX spider en ZAP (input ajax_spider): descubre la API /rest de SPAs Angular/React.
+#     El run #11 no detectó SQLi/XSS en Juice Shop por no recorrer la SPA; esto lo corrige.
+#   - Enumeración de usuarios real (T2/T5/T7): input login_path -> dast_logic.py --login-path
+#     compara respuestas de usuario válido-aparente vs inexistente (no destructivo).
+#   - Consolidador filtra ruido informativo (Modern Web App, User Agent Fuzzer, etc.).
+#   - Gate ADR-004: verify_method = file | dns | meta (a elección del cliente).
+#   - T6: dast_logic.py resuelve <script src> relativos (bundles Angular/Vite/Lovable).
 name: AG-06 DAST
 
 on:
@@ -28,13 +36,26 @@ on:
         required: false
         default: ""
       verify_token:  # gitleaks:allow — nombre del input; el valor se publica en /.well-known, no es un secreto
-        description: "Token esperado en /.well-known/soc-verify.txt (solo external)"
+        description: "Token de verificación de propiedad (solo external)"
         required: false
         default: ""
+      verify_method:
+        description: "Método de verificación (ADR-004): file=/.well-known/soc-verify.txt · dns=TXT soc-verify=<token> · meta=<meta name=soc-verify>"
+        type: choice
+        options: [file, dns, meta]
+        default: file
       active_scan:
         description: "Incluir fase activa (ZAP + Nuclei)"
         type: boolean
         default: true
+      ajax_spider:
+        description: "AJAX spider en ZAP (necesario para SPAs Angular/React que exponen API /rest)"
+        type: boolean
+        default: true
+      login_path:
+        description: "Ruta de login para pruebas de enumeración (ej: /rest/user/login). Vacío = omite T2/T5/T7"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -53,9 +74,11 @@ jobs:
       IN_MODE: ${{ inputs.target_mode }}
       IN_URL: ${{ inputs.target_url }}
       IN_TOKEN: ${{ inputs.verify_token }}
+      IN_LOGIN: ${{ inputs.login_path }}
+      IN_METHOD: ${{ inputs.verify_method }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Preparar entorno
         run: |
@@ -66,6 +89,10 @@ jobs:
             lab|external) echo "Modo: $IN_MODE" ;;
             *) echo "::error::target_mode inválido"; exit 1 ;;
           esac
+          # login_path (opcional): solo ruta simple, sin metacaracteres de shell ni query string.
+          if [ -n "$IN_LOGIN" ] && ! [[ "$IN_LOGIN" =~ ^/[A-Za-z0-9._~/-]*$ ]]; then
+            echo "::error::login_path con formato no permitido (solo /ruta/simple)."; exit 1
+          fi
 
       # ---------- Resolver objetivo, levantar app y GATE de propiedad ----------
       - name: Resolver objetivo y verificar propiedad
@@ -127,14 +154,45 @@ jobs:
           done
           echo "IPs verificadas (públicas): $(echo $IPS | tr '\n' ' ')"
 
-          # Verificación de propiedad (G1/G2) — sin seguir redirecciones
-          GOT=$(curl -fsS --max-time 15 --max-filesize 4096 --proto '=https' \
-                "https://$HOSTPORT/.well-known/soc-verify.txt" 2>/dev/null | tr -d '[:space:]' || true)
-          if [ "$GOT" != "$IN_TOKEN" ]; then
-            echo "::error::Verificación de propiedad FALLIDA para $HOST. Sin propiedad verificada no se escanea (G1)."
+          # Verificación de propiedad (G1/G2) — ADR-004: 3 métodos a elección del cliente.
+          # Ninguno sigue redirecciones (un 30x a otro host no prueba control del objetivo).
+          OK=0
+          case "$IN_METHOD" in
+            file)
+              GOT=$(curl -fsS --max-time 15 --max-filesize 4096 --proto '=https' \
+                    "https://$HOSTPORT/.well-known/soc-verify.txt" 2>/dev/null | tr -d '[:space:]' || true)
+              [ "$GOT" = "$IN_TOKEN" ] && OK=1 ;;
+            dns)
+              # TXT en el host exacto o en _soc-verify.<host>. dig viene en ubuntu-24.04 (dnsutils).
+              for NAME in "$HOST" "_soc-verify.$HOST"; do
+                if dig +short TXT "$NAME" 2>/dev/null | tr -d '"' | grep -qxF "soc-verify=$IN_TOKEN"; then
+                  OK=1; break
+                fi
+              done ;;
+            meta)
+              # <meta name="soc-verify" content="TOKEN"> en el HTML de la URL exacta (máx. 512 KB).
+              curl -fsS --max-time 15 --max-filesize 524288 --proto '=https' "$IN_URL" \
+                -o "$RUNNER_TEMP/verify.html" 2>/dev/null || true
+              if python3 - "$RUNNER_TEMP/verify.html" "$IN_TOKEN" <<'PY'
+          import re, sys
+          html = open(sys.argv[1], encoding="utf-8", errors="replace").read() if __import__("os").path.exists(sys.argv[1]) else ""
+          tok = sys.argv[2]
+          for tag in re.findall(r"<meta\b[^>]*>", html, re.I):
+              if re.search(r"""name\s*=\s*["']soc-verify["']""", tag, re.I):
+                  m = re.search(r"""content\s*=\s*["']([^"']*)["']""", tag, re.I)
+                  if m and m.group(1).strip() == tok:
+                      sys.exit(0)
+          sys.exit(1)
+          PY
+              then OK=1; fi ;;
+            *) echo "::error::verify_method inválido"; exit 1 ;;
+          esac
+          if [ "$OK" != "1" ]; then
+            echo "::error::Verificación de propiedad FALLIDA para $HOST (método: $IN_METHOD). Sin propiedad verificada no se escanea (G1)."
             exit 1
           fi
-          echo "Propiedad verificada para $HOST."
+          echo "Propiedad verificada para $HOST (método: $IN_METHOD)."
+          echo "VERIFY_METHOD=$IN_METHOD" >> "$GITHUB_ENV"
           {
             echo "TARGET=$IN_URL"
             echo "TARGET_HOST=$HOSTPORT"
@@ -158,23 +216,35 @@ jobs:
             --out "$OUT/secrets.json" || true
 
       # ---------- Fase activa ----------
-      # ZAP full scan = spider + escaneo ACTIVO, acotado en tiempo para caber en el runner.
-      #   -m 2                         spider tradicional 2 min
-      #   maxScanDurationInMins=12     el active scan se corta a 12 min y escribe el reporte
-      #   maxRuleDurationInMins=2      ninguna regla individual se cuelga > 2 min
-      #   timeout 18m (externo)        colchón duro: si ZAP se pasa igual, se mata y el pipeline sigue
-      # Sin ajax spider: en Juice Shop (Angular) es demasiado pesado para el runner; en producción
-      # (Container Apps Jobs, sin límite de GitHub) se puede reactivar con -j. Perfil activo: seguro
-      # contra Juice Shop local; contra apps de clientes requiere su autorización (ADR-004).
+      # ZAP full scan = spider + (opcional) AJAX spider + escaneo ACTIVO, acotado para el runner.
+      #   -m 4                         spider tradicional 4 min
+      #   -j                           AJAX spider: recorre la SPA (Angular/React) y descubre la API
+      #                                /rest que el spider tradicional no ve. SIN él, el run #11 no
+      #                                detectó inyecciones aunque Juice Shop es vulnerable.
+      #   ajax.maxDuration=5           corta el AJAX spider a 5 min para no comerse el presupuesto
+      #   ajax.browserId=firefox-headless  navegador headless incluido en la imagen de ZAP
+      #   maxScanDurationInMins=18     el active scan se corta a 18 min y escribe el reporte
+      #   maxRuleDurationInMins=3      ninguna regla individual se cuelga > 3 min
+      #   timeout 32m                  colchón duro dentro del timeout-minutes: 45 del job
+      # Perfil activo: seguro contra Juice Shop local; contra apps de clientes exige su
+      # autorización y propiedad verificada (ADR-004, gate previo).
       - name: OWASP ZAP full scan (activo, acotado)  [T9, T10, inyecciones, params]
         if: ${{ inputs.active_scan }}
         continue-on-error: true
+        env:
+          IN_AJAX: ${{ inputs.ajax_spider }}
         run: |
-          timeout 18m docker run --rm --network host -v "$OUT":/zap/wrk:rw \
+          ZAP_Z="-config ascan.maxScanDurationInMins=18 -config ascan.maxRuleDurationInMins=3"
+          AJAX_FLAG=""
+          if [ "$IN_AJAX" = "true" ]; then
+            AJAX_FLAG="-j"
+            ZAP_Z="$ZAP_Z -config ajaxSpider.maxDuration=5 -config ajaxSpider.browserId=firefox-headless"
+          fi
+          timeout 32m docker run --rm --network host -v "$OUT":/zap/wrk:rw \
             ghcr.io/zaproxy/zaproxy:stable \
             zap-full-scan.py -t "$TARGET" \
-            -J zap.json -r zap.html -I -m 2 \
-            -z "-config ascan.maxScanDurationInMins=12 -config ascan.maxRuleDurationInMins=2" || true
+            -J zap.json -r zap.html -I -m 4 $AJAX_FLAG \
+            -z "$ZAP_Z" || true
           ls -la "$OUT" || true
 
       - name: Nuclei  [T11 TRACE, T12 smuggling, misconfig]
@@ -195,12 +265,17 @@ jobs:
           fi
 
       # ---------- Lógica de negocio ----------
-      - name: Pruebas de lógica (rate limit, enumeración)  [T2, T3, T5]
+      - name: Pruebas de lógica (rate limit, enumeración)  [T2, T3, T5, T7]
         if: ${{ inputs.active_scan }}
         continue-on-error: true
         run: |
+          LOGIN_ARG=""
+          if [ -n "$IN_LOGIN" ]; then
+            LOGIN_ARG="--login-path $IN_LOGIN"
+          fi
           python3 scripts/dast_logic.py logic \
             --target "$TARGET" \
+            $LOGIN_ARG \
             --out "$OUT/logic.json" || true
 
       # ---------- Consolidación ----------
@@ -218,7 +293,7 @@ jobs:
         run: docker rm -f juiceshop || true
 
       - name: Publicar artefacto
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: informe-ag06
           path: ${{ runner.temp }}/dast
