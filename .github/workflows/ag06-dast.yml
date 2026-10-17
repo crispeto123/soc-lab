@@ -21,6 +21,10 @@
 #   - Consolidador filtra ruido informativo (Modern Web App, User Agent Fuzzer, etc.).
 #   - Gate ADR-004: verify_method = file | dns | meta (a elección del cliente).
 #   - T6: dast_logic.py resuelve <script src> relativos (bundles Angular/Vite/Lovable).
+# v1.1.1 (17-oct-2026): run #12 cancelado a los 45 min (ZAP 42,7 min) sin artefacto.
+#   - Orden: lógica y Nuclei antes que ZAP; ZAP con presupuesto ~27 min y corte duro.
+#   - Consolidación y artefacto con always(): siempre hay informe con lo disponible.
+#   - Job 55 min; timeout por paso.
 name: AG-06 DAST
 
 on:
@@ -69,7 +73,7 @@ jobs:
   ag06-dast:
     name: AG-06 Escaneo DAST
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 55
     env:
       IN_MODE: ${{ inputs.target_mode }}
       IN_URL: ${{ inputs.target_url }}
@@ -216,58 +220,14 @@ jobs:
             --out "$OUT/secrets.json" || true
 
       # ---------- Fase activa ----------
-      # ZAP full scan = spider + (opcional) AJAX spider + escaneo ACTIVO, acotado para el runner.
-      #   -m 4                         spider tradicional 4 min
-      #   -j                           AJAX spider: recorre la SPA (Angular/React) y descubre la API
-      #                                /rest que el spider tradicional no ve. SIN él, el run #11 no
-      #                                detectó inyecciones aunque Juice Shop es vulnerable.
-      #   ajax.maxDuration=5           corta el AJAX spider a 5 min para no comerse el presupuesto
-      #   ajax.browserId=firefox-headless  navegador headless incluido en la imagen de ZAP
-      #   maxScanDurationInMins=18     el active scan se corta a 18 min y escribe el reporte
-      #   maxRuleDurationInMins=3      ninguna regla individual se cuelga > 3 min
-      #   timeout 32m                  colchón duro dentro del timeout-minutes: 45 del job
-      # Perfil activo: seguro contra Juice Shop local; contra apps de clientes exige su
-      # autorización y propiedad verificada (ADR-004, gate previo).
-      - name: OWASP ZAP full scan (activo, acotado)  [T9, T10, inyecciones, params]
-        if: ${{ inputs.active_scan }}
-        continue-on-error: true
-        env:
-          IN_AJAX: ${{ inputs.ajax_spider }}
-        run: |
-          ZAP_Z="-config ascan.maxScanDurationInMins=18 -config ascan.maxRuleDurationInMins=3"
-          AJAX_FLAG=""
-          if [ "$IN_AJAX" = "true" ]; then
-            AJAX_FLAG="-j"
-            ZAP_Z="$ZAP_Z -config ajaxSpider.maxDuration=5 -config ajaxSpider.browserId=firefox-headless"
-          fi
-          timeout 32m docker run --rm --network host -v "$OUT":/zap/wrk:rw \
-            ghcr.io/zaproxy/zaproxy:stable \
-            zap-full-scan.py -t "$TARGET" \
-            -J zap.json -r zap.html -I -m 4 $AJAX_FLAG \
-            -z "$ZAP_Z" || true
-          ls -la "$OUT" || true
-
-      - name: Nuclei  [T11 TRACE, T12 smuggling, misconfig]
-        if: ${{ inputs.active_scan }}
-        continue-on-error: true
-        run: |
-          NV=$(curl -fsSL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
-               | grep -oP '"tag_name":\s*"v\K[^"]+' || true)
-          if [ -n "$NV" ]; then
-            curl -fsSL -o /tmp/nuclei.zip \
-              "https://github.com/projectdiscovery/nuclei/releases/download/v${NV}/nuclei_${NV}_linux_amd64.zip" || true
-            unzip -o /tmp/nuclei.zip -d /tmp/nuclei >/dev/null 2>&1 || true
-            if [ -x /tmp/nuclei/nuclei ]; then
-              /tmp/nuclei/nuclei -u "$TARGET" \
-                -severity low,medium,high,critical -rate-limit 30 -timeout 5 \
-                -jsonl -o "$OUT/nuclei.jsonl" -silent || true
-            fi
-          fi
+      # v1.1.1: primero lo rápido (lógica, Nuclei), ZAP al final. Si ZAP se pasa de tiempo,
+      # lo demás ya quedó guardado y la consolidación/artefacto corren igual (always()).
 
       # ---------- Lógica de negocio ----------
       - name: Pruebas de lógica (rate limit, enumeración)  [T2, T3, T5, T7]
         if: ${{ inputs.active_scan }}
         continue-on-error: true
+        timeout-minutes: 3
         run: |
           LOGIN_ARG=""
           if [ -n "$IN_LOGIN" ]; then
@@ -278,8 +238,58 @@ jobs:
             $LOGIN_ARG \
             --out "$OUT/logic.json" || true
 
-      # ---------- Consolidación ----------
+      - name: Nuclei  [T11 TRACE, T12 smuggling, misconfig]
+        if: ${{ inputs.active_scan }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          NV=$(curl -fsSL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
+               | grep -oP '"tag_name":\s*"v\K[^"]+' || true)
+          if [ -n "$NV" ]; then
+            curl -fsSL -o /tmp/nuclei.zip \
+              "https://github.com/projectdiscovery/nuclei/releases/download/v${NV}/nuclei_${NV}_linux_amd64.zip" || true
+            unzip -o /tmp/nuclei.zip -d /tmp/nuclei >/dev/null 2>&1 || true
+            if [ -x /tmp/nuclei/nuclei ]; then
+              timeout 8m /tmp/nuclei/nuclei -u "$TARGET" \
+                -severity low,medium,high,critical -rate-limit 30 -timeout 5 \
+                -jsonl -o "$OUT/nuclei.jsonl" -silent || true
+            fi
+          fi
+
+      # ZAP full scan = spider + (opcional) AJAX spider + escaneo ACTIVO, acotado para el runner.
+      # Presupuesto v1.1.1 (run #12 duró 42,7 min con v1.1 y el job se canceló a los 45):
+      #   -m 3                         spider tradicional 3 min
+      #   -j + ajaxSpider.maxDuration=4  AJAX spider 4 min: recorre la SPA y descubre la API /rest
+      #   -T 5                         máx. 5 min esperando arranque + escaneo pasivo
+      #   maxScanDurationInMins=14     el active scan se corta a 14 min y escribe el reporte
+      #   maxRuleDurationInMins=2      ninguna regla individual > 2 min
+      #   timeout 28m + docker kill    corte duro; el contenedor tiene nombre para matarlo seguro
+      # Perfil activo: seguro contra Juice Shop local; contra apps de clientes exige su
+      # autorización y propiedad verificada (ADR-004, gate previo).
+      - name: OWASP ZAP full scan (activo, acotado)  [T9, T10, inyecciones, params]
+        if: ${{ inputs.active_scan }}
+        continue-on-error: true
+        timeout-minutes: 31
+        env:
+          IN_AJAX: ${{ inputs.ajax_spider }}
+        run: |
+          ZAP_Z="-config ascan.maxScanDurationInMins=14 -config ascan.maxRuleDurationInMins=2"
+          AJAX_FLAG=""
+          if [ "$IN_AJAX" = "true" ]; then
+            AJAX_FLAG="-j"
+            ZAP_Z="$ZAP_Z -config ajaxSpider.maxDuration=4 -config ajaxSpider.browserId=firefox-headless"
+          fi
+          timeout --kill-after=30s 28m docker run --rm --name ag06-zap --network host \
+            -v "$OUT":/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py -t "$TARGET" \
+            -J zap.json -r zap.html -I -m 3 -T 5 $AJAX_FLAG \
+            -z "$ZAP_Z" || echo "::warning::ZAP no terminó dentro del presupuesto; se consolida lo disponible."
+          docker kill ag06-zap >/dev/null 2>&1 || true
+          ls -la "$OUT" || true
+
+      # ---------- Consolidación (siempre, con lo que haya) ----------
       - name: Consolidar hallazgos -> findings.json
+        if: always() && steps.target.outcome == 'success'
         run: |
           python3 scripts/dast_consolidar.py "$OUT" \
             --target "$TARGET" \
@@ -293,6 +303,7 @@ jobs:
         run: docker rm -f juiceshop || true
 
       - name: Publicar artefacto
+        if: always() && steps.target.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: informe-ag06
