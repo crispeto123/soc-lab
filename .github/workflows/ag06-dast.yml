@@ -25,6 +25,7 @@
 #   - Orden: lógica y Nuclei antes que ZAP; ZAP con presupuesto ~27 min y corte duro.
 #   - Consolidación y artefacto con always(): siempre hay informe con lo disponible.
 #   - Job 55 min; timeout por paso.
+# v1.1.2 (17-oct-2026): límite del active scan con la clave correcta scanner.* (run #13 sin zap.json).
 name: AG-06 DAST
 
 on:
@@ -261,7 +262,7 @@ jobs:
       #   -m 3                         spider tradicional 3 min
       #   -j + ajaxSpider.maxDuration=4  AJAX spider 4 min: recorre la SPA y descubre la API /rest
       #   -T 5                         máx. 5 min esperando arranque + escaneo pasivo
-      #   maxScanDurationInMins=14     el active scan se corta a 14 min y escribe el reporte
+      #   scanner.maxScanDurationInMins=12  el active scan se corta a 12 min y escribe el reporte
       #   maxRuleDurationInMins=2      ninguna regla individual > 2 min
       #   timeout 28m + docker kill    corte duro; el contenedor tiene nombre para matarlo seguro
       # Perfil activo: seguro contra Juice Shop local; contra apps de clientes exige su
@@ -273,7 +274,10 @@ jobs:
         env:
           IN_AJAX: ${{ inputs.ajax_spider }}
         run: |
-          ZAP_Z="-config ascan.maxScanDurationInMins=14 -config ascan.maxRuleDurationInMins=2"
+          # v1.1.2: la clave correcta es scanner.* (verificado en ScannerParam.java de ZAP).
+          # Con ascan.* ZAP ignoraba el límite: run #13 se cortó a los 28 min SIN escribir reporte.
+          ZAP_Z="-config scanner.maxScanDurationInMins=12 -config scanner.maxRuleDurationInMins=2"
+          ZAP_Z="$ZAP_Z -config scanner.threadPerHost=4"
           AJAX_FLAG=""
           if [ "$IN_AJAX" = "true" ]; then
             AJAX_FLAG="-j"
