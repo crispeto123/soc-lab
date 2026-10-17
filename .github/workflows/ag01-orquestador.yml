@@ -20,10 +20,10 @@ concurrency:
 jobs:
   ag02-code-reviewer:
     name: AG-02 Code Reviewer
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Semgrep (SAST)
         run: |
           pip install --quiet semgrep
@@ -33,7 +33,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest \
             dir /repo --report-format sarif --report-path /repo/gitleaks.sarif --exit-code 0 || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sarif-ag02
           path: "*.sarif"
@@ -41,10 +41,10 @@ jobs:
 
   ag03-dependency-iac:
     name: AG-03 Dependency & IaC Auditor
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Trivy (dependencias + misconfig)
         run: |
           docker run --rm -v "$PWD:/src" aquasec/trivy:latest fs /src \
@@ -59,7 +59,7 @@ jobs:
           checkov -d . --framework bicep dockerfile --output sarif \
             --output-file-path checkov-out --soft-fail --quiet || true
           [ -f checkov-out/results_sarif.sarif ] && mv checkov-out/results_sarif.sarif checkov.sarif || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sarif-ag03
           path: "*.sarif"
@@ -69,11 +69,11 @@ jobs:
     name: AG-01 Consolidar e informar
     needs: [ag02-code-reviewer, ag03-dependency-iac]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: sarif-*
           path: sarif
@@ -83,7 +83,7 @@ jobs:
         run: |
           python scripts/consolidar.py sarif informe
           cat informe/resumen.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: informe-ag01
           path: informe/
