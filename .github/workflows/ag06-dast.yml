@@ -30,6 +30,10 @@
 #   el consolidador descarta hallazgos de otros hosts.
 # v1.1.4 (17-oct-2026): zap.log en el artefacto + aviso explícito si ZAP no genera reporte
 #   (run #15 terminó "bien" pero sin zap.json y sin forma de ver por qué).
+# v1.1.5 (17-oct-2026): active scan 12 -> 20 min (run #16: la SQLi de /rest/products/search no se
+#   alcanzó a probar en 12 min; en #14 sí). Job total estimado ~30 min de 55.
+#   Alcance verificado en #16: 0 reglas activas fuera del host; el tráfico a terceros proviene
+#   de seguir la redirección abierta de la propia app (riesgo residual aceptado, ADR-004).
 name: AG-06 DAST
 
 on:
@@ -271,15 +275,15 @@ jobs:
       # Presupuesto:
       #   -m 3                         spider tradicional y Client spider, 3 min cada uno
       #   -T 5                         máx. 5 min esperando arranque + escaneo pasivo
-      #   scanner.maxScanDurationInMins=12  el active scan se corta a 12 min y escribe el reporte
-      #   scanner.maxRuleDurationInMins=2   ninguna regla individual > 2 min
-      #   timeout 28m + docker kill    corte duro; el contenedor tiene nombre para matarlo seguro
+      #   scanner.maxScanDurationInMins=20  el active scan se corta a 20 min y escribe el reporte
+      #   scanner.maxRuleDurationInMins=3   ninguna regla individual > 3 min
+      #   timeout 36m + docker kill    corte duro; el contenedor tiene nombre para matarlo seguro
       # Perfil activo: seguro contra Juice Shop local; contra apps de clientes exige su
       # autorización y propiedad verificada (ADR-004, gate previo).
       - name: OWASP ZAP full scan (activo, acotado)  [T9, T10, inyecciones, params]
         if: ${{ inputs.active_scan }}
         continue-on-error: true
-        timeout-minutes: 31
+        timeout-minutes: 39
         env:
           IN_AJAX: ${{ inputs.ajax_spider }}
         run: |
@@ -300,13 +304,13 @@ jobs:
           chmod 666 "$OUT/ag06.context"
 
           # v1.1.2: la clave correcta es scanner.* (verificado en ScannerParam.java de ZAP).
-          ZAP_Z="-config scanner.maxScanDurationInMins=12 -config scanner.maxRuleDurationInMins=2"
+          ZAP_Z="-config scanner.maxScanDurationInMins=20 -config scanner.maxRuleDurationInMins=3"
           ZAP_Z="$ZAP_Z -config scanner.threadPerHost=4"
           BROWSER_FLAG=""
           if [ "$IN_AJAX" = "true" ]; then
             BROWSER_FLAG="-j"   # Client spider (navegador) dentro del contexto
           fi
-          timeout --kill-after=30s 28m docker run --rm --name ag06-zap --network host \
+          timeout --kill-after=30s 36m docker run --rm --name ag06-zap --network host \
             -v "$OUT":/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable \
             zap-full-scan.py -t "$TARGET" -n ag06.context \
             -J zap.json -r zap.html -I -m 3 -T 5 $BROWSER_FLAG \
