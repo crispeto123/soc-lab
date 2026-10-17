@@ -28,6 +28,8 @@
 # v1.1.2 (17-oct-2026): límite del active scan con la clave correcta scanner.* (run #13 sin zap.json).
 # v1.1.3 (17-oct-2026): alcance G5 — contexto ZAP limitado al host objetivo (run #14 salió a github.com);
 #   el consolidador descarta hallazgos de otros hosts.
+# v1.1.4 (17-oct-2026): zap.log en el artefacto + aviso explícito si ZAP no genera reporte
+#   (run #15 terminó "bien" pero sin zap.json y sin forma de ver por qué).
 name: AG-06 DAST
 
 on:
@@ -308,7 +310,14 @@ jobs:
             -v "$OUT":/zap/wrk:rw ghcr.io/zaproxy/zaproxy:stable \
             zap-full-scan.py -t "$TARGET" -n ag06.context \
             -J zap.json -r zap.html -I -m 3 -T 5 $BROWSER_FLAG \
-            -z "$ZAP_Z" || echo "::warning::ZAP no terminó dentro del presupuesto; se consolida lo disponible."
+            -z "$ZAP_Z" > "$OUT/zap.log" 2>&1
+          ZRC=$?
+          echo "zap-full-scan exit code: $ZRC" | tee -a "$OUT/zap.log"
+          tail -n 40 "$OUT/zap.log" || true
+          # 0/1/2 = terminó (sin/ con WARN / con FAIL). 3 = error de ZAP. 124/137 = corte por tiempo.
+          if [ ! -s "$OUT/zap.json" ]; then
+            echo "::error::ZAP no generó zap.json (exit $ZRC). Ver zap.log en el artefacto."
+          fi
           docker kill ag06-zap >/dev/null 2>&1 || true
           ls -la "$OUT" || true
 
