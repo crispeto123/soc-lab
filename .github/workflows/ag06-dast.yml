@@ -41,6 +41,9 @@
 #   - Rate limit también sobre login_path (POST), no solo la raíz: es el endpoint que importa
 #     para fuerza bruta. La ráfaga usa SIEMPRE un usuario inexistente (no bloquea cuentas reales).
 #   - Consolidador: "Proxy Disclosure" de ZAP -> P4 (informativo), no P2.
+# v1.1.7 (19-oct-2026, ADR-005): el test anti-fuerza bruta del login usa un BASELINE ESTÁNDAR
+#   (30 intentos, OWASP ASVS 2.2.1 / WSTG-ATHN-03), igual para toda app y sin calibrar al
+#   umbral interno del objetivo (caja negra). Antes eran 15, por debajo de controles comunes.
 name: AG-06 DAST
 
 on:

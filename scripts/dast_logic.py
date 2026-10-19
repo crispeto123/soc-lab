@@ -145,20 +145,27 @@ def run_logic(target, out, login_path=None, user_field="email", pass_field="pass
         likely = login_user or f"admin@{host}"          # usuario plausible (configurable)
         bogus = "no-existe-ag06-9f3a2b@" + host          # usuario casi seguro inexistente
 
-        # v1.1.6: T3 también sobre el LOGIN, que es el endpoint que de verdad importa
-        # (fuerza bruta / credential stuffing). Ráfaga corta de POST con password inválido
-        # SIEMPRE contra el usuario inexistente, para no arriesgar bloqueo de una cuenta real.
+        # T3 sobre el LOGIN (fuerza bruta / credential stuffing), endpoint que de verdad importa.
+        # Ráfaga de POST con password inválido SIEMPRE contra el usuario inexistente, para no
+        # arriesgar bloqueo de una cuenta real.
+        # v1.1.7 (ADR-005): BASELINE ESTÁNDAR, igual para toda app (caja negra). No se calibra
+        # al umbral interno del objetivo. AUTH_BURST=30 supera cualquier control razonable
+        # (OWASP ASVS 2.2.1 anti-automatización; WSTG-ATHN-03): una app que cumple el estándar
+        # frena la fuerza bruta (429 / lockout) mucho antes de 30 intentos rápidos. Si a los 30
+        # no hay señal de freno, NO cumple el estándar.
+        AUTH_BURST = 30
         def one_login(_):
             return enum_probe(login_url, bogus, user_field, pass_field)[0]
         with ThreadPoolExecutor(max_workers=10) as ex:
-            lcodes = list(ex.map(one_login, range(15)))
+            lcodes = list(ex.map(one_login, range(AUTH_BURST)))
         if lcodes and not any(c == 429 for c in lcodes if c):
             findings.append({
                 "category": "rate_limit",
-                "title": "Posible ausencia de rate limit en el login (sin 429 en ráfaga corta)",
+                "title": "Login sin control anti-fuerza bruta (no cumple baseline OWASP)",
                 "cwe": "CWE-307", "cvss": 6.5, "priority": "P2",
                 "location": login_url,
-                "evidence": f"15 intentos de login, códigos: {sorted(set(c for c in lcodes if c))}",
+                "evidence": (f"{AUTH_BURST} intentos de login sin 429/bloqueo; "
+                             f"códigos: {sorted(set(c for c in lcodes if c))}"),
                 "recommendation": ("Limitar intentos por IP/usuario y responder 429; añadir backoff "
                                    "y CAPTCHA/MFA. En borde: rate limit del WAF sobre la ruta de login."),
                 "status": "nuevo",
