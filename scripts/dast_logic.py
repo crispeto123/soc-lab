@@ -94,26 +94,34 @@ def run_secrets(target, out):
     print(f"secrets: {len(uniq)} hallazgo(s)")
 
 
-def enum_probe(login_url, email):
-    """Un intento de login NO destructivo: email dado + password inválido fijo.
+BAD_PW = "Zz!invalid-ag06-000000"  # password basura: nunca inicia sesión
+
+
+def enum_probe(login_url, user, user_field="email", pass_field="password"):
+    """Un intento de login NO destructivo: usuario dado + password inválido fijo.
     Nunca inicia sesión (la contraseña es basura) y es una sola solicitud por usuario.
-    Prueba JSON {email,password}; si el server no lo acepta, cae a form-urlencoded.
+    v1.1.6: nombres de campo configurables (user_field/pass_field) para apps que no usan
+    email/password (p. ej. documento/cédula, usuario/clave). Prueba JSON; si el server no
+    lo acepta, cae a form-urlencoded (incluye email+username por compatibilidad).
     Devuelve (status, longitud_cuerpo, nº_palabras, extracto) para comparar respuestas."""
-    bad_pw = "Zz!invalid-ag06-000000"
-    payload = json.dumps({"email": email, "password": bad_pw})
+    payload = json.dumps({user_field: user, pass_field: BAD_PW})
     status, _, body = fetch(login_url, method="POST", data=payload,
                             headers={"Content-Type": "application/json", "Accept": "application/json"})
     if status in (None, 404, 405, 415):  # endpoint no acepta JSON: intento form
-        form = urllib.parse.urlencode({"email": email, "username": email, "password": bad_pw})
+        fields = {user_field: user, pass_field: BAD_PW}
+        if user_field != "username":
+            fields.setdefault("username", user)  # compat: algunos forms esperan 'username'
+        form = urllib.parse.urlencode(fields)
         status, _, body = fetch(login_url, method="POST", data=form,
                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
     return status, len(body or ""), len((body or "").split()), (body or "")[:120]
 
 
-def run_logic(target, out, login_path=None):
+def run_logic(target, out, login_path=None, user_field="email", pass_field="password",
+              login_user=None):
     findings = []
 
-    # T3: rate limit. Ráfaga CORTA (no destructiva) y observa si aparece 429.
+    # T3: rate limit en la RAÍZ. Ráfaga CORTA (no destructiva) y observa si aparece 429.
     def one(_):
         return fetch(target, timeout=8)[0]
     with ThreadPoolExecutor(max_workers=10) as ex:
@@ -134,10 +142,30 @@ def run_logic(target, out, login_path=None):
     if login_path:
         login_url = target.rstrip("/") + "/" + login_path.lstrip("/")
         host = urllib.parse.urlparse(target).hostname or "example.com"
-        likely = f"admin@{host}"                       # usuario plausible
-        bogus = "no-existe-ag06-9f3a2b@" + host         # usuario casi seguro inexistente
-        r_likely = enum_probe(login_url, likely)
-        r_bogus = enum_probe(login_url, bogus)
+        likely = login_user or f"admin@{host}"          # usuario plausible (configurable)
+        bogus = "no-existe-ag06-9f3a2b@" + host          # usuario casi seguro inexistente
+
+        # v1.1.6: T3 también sobre el LOGIN, que es el endpoint que de verdad importa
+        # (fuerza bruta / credential stuffing). Ráfaga corta de POST con password inválido
+        # SIEMPRE contra el usuario inexistente, para no arriesgar bloqueo de una cuenta real.
+        def one_login(_):
+            return enum_probe(login_url, bogus, user_field, pass_field)[0]
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            lcodes = list(ex.map(one_login, range(15)))
+        if lcodes and not any(c == 429 for c in lcodes if c):
+            findings.append({
+                "category": "rate_limit",
+                "title": "Posible ausencia de rate limit en el login (sin 429 en ráfaga corta)",
+                "cwe": "CWE-307", "cvss": 6.5, "priority": "P2",
+                "location": login_url,
+                "evidence": f"15 intentos de login, códigos: {sorted(set(c for c in lcodes if c))}",
+                "recommendation": ("Limitar intentos por IP/usuario y responder 429; añadir backoff "
+                                   "y CAPTCHA/MFA. En borde: rate limit del WAF sobre la ruta de login."),
+                "status": "nuevo",
+            })
+
+        r_likely = enum_probe(login_url, likely, user_field, pass_field)
+        r_bogus = enum_probe(login_url, bogus, user_field, pass_field)
         if r_likely[0] is not None and r_bogus[0] is not None:
             diff_code = r_likely[0] != r_bogus[0]
             diff_len = abs(r_likely[1] - r_bogus[1]) > 16
@@ -182,12 +210,19 @@ def main():
     ap.add_argument("--target", required=True)
     ap.add_argument("--login-path", dest="login_path", default=None,
                     help="Ruta de login para la prueba de enumeración (ej: /rest/user/login)")
+    ap.add_argument("--login-user-field", dest="user_field", default="email",
+                    help="Nombre del campo de usuario en el login (default: email; ej: documento, usuario)")
+    ap.add_argument("--login-pass-field", dest="pass_field", default="password",
+                    help="Nombre del campo de contraseña en el login (default: password; ej: clave)")
+    ap.add_argument("--login-user", dest="login_user", default=None,
+                    help="Valor de usuario plausible para la prueba de enumeración (ej: una cédula de prueba)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     if a.op == "secrets":
         run_secrets(a.target, a.out)
     else:
-        run_logic(a.target, a.out, login_path=a.login_path)
+        run_logic(a.target, a.out, login_path=a.login_path,
+                  user_field=a.user_field, pass_field=a.pass_field, login_user=a.login_user)
 
 
 if __name__ == "__main__":
