@@ -26,6 +26,7 @@ RULES = {
     "weak cipher": ("CWE-326", 3.1, "P4"),
     "caa": ("CWE-295", 0.0, "P4"),
     "certificate": ("CWE-295", 0.0, "P4"),
+    "proxy disclosure": ("CWE-204", 3.1, "P4"),  # v1.1.6: ZAP Proxy Disclosure -> informativo (P4)
 }
 
 PRIO_ORDER = {"P1": 0, "P2": 1, "P3": 2, "P4": 3}
@@ -88,11 +89,21 @@ def mask(text):
     return text[:400]
 
 
-def classify(title, default_cwe="CWE-16", default_cvss=3.0):
+def rule_for(title):
+    """Devuelve (cwe, cvss, prio) de la primera regla cuyo término aparezca en el título,
+    o None si ninguna coincide. v1.1.6: permite que una regla específica (Proxy Disclosure,
+    cookie, etc.) fije prioridad por encima del riesgo genérico de la herramienta."""
     low = (title or "").lower()
-    for key, (cwe, cvss, prio) in RULES.items():
+    for key, val in RULES.items():
         if key in low:
-            return cwe, cvss, prio
+            return val
+    return None
+
+
+def classify(title, default_cwe="CWE-16", default_cvss=3.0):
+    r = rule_for(title)
+    if r:
+        return r
     return default_cwe, default_cvss, prio_from_cvss(default_cvss)
 
 
@@ -134,14 +145,20 @@ def from_zap(data):
             risk = (alert.get("riskdesc") or "").split(" ")[0].lower()
             cvss = {"high": 7.0, "medium": 5.0, "low": 3.0, "informational": 0.0}.get(risk, 3.0)
             inst = (alert.get("instances") or [{}])[0]
-            c2, cv2, _ = classify(title, cwe or "CWE-16", cvss)
-            rows.append({
+            # v1.1.6: si el título coincide con una regla específica (p. ej. Proxy Disclosure),
+            # esa regla manda sobre el riesgo genérico de ZAP (fija CVSS y prioridad).
+            rule = rule_for(title)
+            row = {
                 "source_tool": "zap", "category": "headers",
-                "title": title, "cwe": cwe or c2, "cvss": cvss,
+                "title": title, "cwe": cwe or (rule[0] if rule else "CWE-16"),
+                "cvss": rule[1] if rule else cvss,
                 "location": inst.get("uri", ""),
                 "evidence": mask(inst.get("evidence", "")),
                 "recommendation": mask(alert.get("solution", ""))[:300],
-            })
+            }
+            if rule:
+                row["priority"] = rule[2]
+            rows.append(row)
     return rows
 
 

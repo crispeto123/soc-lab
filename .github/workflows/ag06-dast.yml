@@ -34,6 +34,13 @@
 #   alcanzó a probar en 12 min; en #14 sí). Job total estimado ~30 min de 55.
 #   Alcance verificado en #16: 0 reglas activas fuera del host; el tráfico a terceros proviene
 #   de seguir la redirección abierta de la propia app (riesgo residual aceptado, ADR-004).
+# v1.1.6 (19-oct-2026): correcciones del run #17 (primer external real, Tarjeta Macarena).
+#   - testssl.log y nuclei.log en el artefacto + aviso si no producen salida (como zap.log en v1.1.4).
+#   - Enumeración con campos de login configurables (login_user_field/login_pass_field) y usuario
+#     de prueba configurable (login_user, p. ej. una cédula): el run #17 asumió email/password.
+#   - Rate limit también sobre login_path (POST), no solo la raíz: es el endpoint que importa
+#     para fuerza bruta. La ráfaga usa SIEMPRE un usuario inexistente (no bloquea cuentas reales).
+#   - Consolidador: "Proxy Disclosure" de ZAP -> P4 (informativo), no P2.
 name: AG-06 DAST
 
 on:
@@ -69,6 +76,18 @@ on:
         description: "Ruta de login para pruebas de enumeración (ej: /rest/user/login). Vacío = omite T2/T5/T7"
         required: false
         default: ""
+      login_user_field:
+        description: "Nombre del campo de usuario en el login (default: email; ej: documento, usuario)"
+        required: false
+        default: "email"
+      login_pass_field:
+        description: "Nombre del campo de contraseña en el login (default: password; ej: clave)"
+        required: false
+        default: "password"
+      login_user:
+        description: "Usuario plausible para la prueba de enumeración (ej: una cédula de prueba). Vacío = admin@<host>"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -89,6 +108,9 @@ jobs:
       IN_TOKEN: ${{ inputs.verify_token }}
       IN_LOGIN: ${{ inputs.login_path }}
       IN_METHOD: ${{ inputs.verify_method }}
+      IN_USERFIELD: ${{ inputs.login_user_field }}
+      IN_PASSFIELD: ${{ inputs.login_pass_field }}
+      IN_LOGINUSER: ${{ inputs.login_user }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -105,6 +127,16 @@ jobs:
           # login_path (opcional): solo ruta simple, sin metacaracteres de shell ni query string.
           if [ -n "$IN_LOGIN" ] && ! [[ "$IN_LOGIN" =~ ^/[A-Za-z0-9._~/-]*$ ]]; then
             echo "::error::login_path con formato no permitido (solo /ruta/simple)."; exit 1
+          fi
+          # Nombres de campo del login: solo identificador simple (letras, dígitos, _, -, .).
+          for v in "$IN_USERFIELD" "$IN_PASSFIELD"; do
+            if [ -n "$v" ] && ! [[ "$v" =~ ^[A-Za-z0-9._-]{1,40}$ ]]; then
+              echo "::error::login_user_field/login_pass_field con formato no permitido."; exit 1
+            fi
+          done
+          # Usuario de prueba: sin espacios ni metacaracteres de shell (admite email, cédula, etc.).
+          if [ -n "$IN_LOGINUSER" ] && ! [[ "$IN_LOGINUSER" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]]; then
+            echo "::error::login_user con formato no permitido."; exit 1
           fi
 
       # ---------- Resolver objetivo, levantar app y GATE de propiedad ----------
@@ -217,9 +249,13 @@ jobs:
         if: steps.target.outputs.host != 'localhost'
         continue-on-error: true
         run: |
-          git clone --depth 1 https://github.com/testssl/testssl.sh.git /tmp/testssl
+          # v1.1.6: toda la salida a testssl.log (como zap.log) para diagnosticar si no hay JSON.
+          git clone --depth 1 https://github.com/testssl/testssl.sh.git /tmp/testssl > "$OUT/testssl.log" 2>&1 || true
           /tmp/testssl/testssl.sh --jsonfile "$OUT/testssl.json" \
-            --protocols --cipher-categories --headers "$TARGET_HOST" || true
+            --protocols --cipher-categories --headers "$TARGET_HOST" >> "$OUT/testssl.log" 2>&1 || true
+          if [ ! -s "$OUT/testssl.json" ]; then
+            echo "::warning::testssl no generó testssl.json (ver testssl.log en el artefacto). Sin datos de TLS/cifrados."
+          fi
 
       - name: Detección de secretos en JS público  [T6]
         continue-on-error: true
@@ -238,13 +274,16 @@ jobs:
         continue-on-error: true
         timeout-minutes: 3
         run: |
-          LOGIN_ARG=""
+          LOGIN_ARGS=()
           if [ -n "$IN_LOGIN" ]; then
-            LOGIN_ARG="--login-path $IN_LOGIN"
+            LOGIN_ARGS+=(--login-path "$IN_LOGIN")
+            [ -n "$IN_USERFIELD" ] && LOGIN_ARGS+=(--login-user-field "$IN_USERFIELD")
+            [ -n "$IN_PASSFIELD" ] && LOGIN_ARGS+=(--login-pass-field "$IN_PASSFIELD")
+            [ -n "$IN_LOGINUSER" ] && LOGIN_ARGS+=(--login-user "$IN_LOGINUSER")
           fi
           python3 scripts/dast_logic.py logic \
             --target "$TARGET" \
-            $LOGIN_ARG \
+            "${LOGIN_ARGS[@]}" \
             --out "$OUT/logic.json" || true
 
       - name: Nuclei  [T11 TRACE, T12 smuggling, misconfig]
@@ -252,17 +291,25 @@ jobs:
         continue-on-error: true
         timeout-minutes: 10
         run: |
+          # v1.1.6: toda la salida (descarga + ejecución) a nuclei.log para diagnóstico.
+          : > "$OUT/nuclei.log"
           NV=$(curl -fsSL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
                | grep -oP '"tag_name":\s*"v\K[^"]+' || true)
+          echo "nuclei version: ${NV:-<no resuelta>}" >> "$OUT/nuclei.log"
           if [ -n "$NV" ]; then
             curl -fsSL -o /tmp/nuclei.zip \
-              "https://github.com/projectdiscovery/nuclei/releases/download/v${NV}/nuclei_${NV}_linux_amd64.zip" || true
-            unzip -o /tmp/nuclei.zip -d /tmp/nuclei >/dev/null 2>&1 || true
+              "https://github.com/projectdiscovery/nuclei/releases/download/v${NV}/nuclei_${NV}_linux_amd64.zip" >> "$OUT/nuclei.log" 2>&1 || true
+            unzip -o /tmp/nuclei.zip -d /tmp/nuclei >> "$OUT/nuclei.log" 2>&1 || true
             if [ -x /tmp/nuclei/nuclei ]; then
               timeout 8m /tmp/nuclei/nuclei -u "$TARGET" \
                 -severity low,medium,high,critical -rate-limit 30 -timeout 5 \
-                -jsonl -o "$OUT/nuclei.jsonl" -silent || true
+                -jsonl -o "$OUT/nuclei.jsonl" -silent >> "$OUT/nuclei.log" 2>&1 || true
+            else
+              echo "nuclei no se pudo descargar/descomprimir" >> "$OUT/nuclei.log"
             fi
+          fi
+          if [ ! -s "$OUT/nuclei.jsonl" ]; then
+            echo "::warning::Nuclei no produjo hallazgos ni salida (ver nuclei.log en el artefacto)."
           fi
 
       # ZAP full scan = spider + (opcional) spider de navegador + escaneo ACTIVO, acotado.
